@@ -1,28 +1,18 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import List, Optional, Literal, Dict, Any, Tuple
-import warnings
+from typing import Any, Dict, List, Literal, Optional, Tuple
 import math
+import warnings
 
 import numpy as np
-import pandas as pd
-
+from fastapi import FastAPI
+from pydantic import BaseModel
 from sklearn.ensemble import GradientBoostingRegressor
-from statsmodels.tsa.holtwinters import (
-    SimpleExpSmoothing,
-    Holt,
-    ExponentialSmoothing,
-)
+from statsmodels.tsa.holtwinters import ExponentialSmoothing, Holt, SimpleExpSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
 
 app = FastAPI(title="Demand Forecast API", version="6.0.0")
 
-
-# =========================================================
-# Request schema
-# =========================================================
 
 AllowedModel = Literal[
     "auto",
@@ -65,9 +55,6 @@ def validate_inputs(demand: List[float], stockout: List[int], periods: int) -> N
 
 
 def clean_demand(demand: List[float], stockout: List[int]) -> List[float]:
-    """
-    stockout = 1 wird als fehlende Beobachtung behandelt und entfernt.
-    """
     return [float(d) for d, s in zip(demand, stockout) if s == 0]
 
 
@@ -76,10 +63,6 @@ def count_nonzero(values: List[float]) -> int:
 
 
 def compute_adi_cv2(series: List[float]) -> Tuple[float, float]:
-    """
-    ADI = Average Demand Interval
-    CV² = (std / mean)^2 auf positiven Nachfragen
-    """
     if not series:
         return float("inf"), float("inf")
 
@@ -88,8 +71,8 @@ def compute_adi_cv2(series: List[float]) -> Tuple[float, float]:
         return float("inf"), float("inf")
 
     adi = len(series) / len(non_zero)
-    mean_nz = np.mean(non_zero)
-    std_nz = np.std(non_zero, ddof=0)
+    mean_nz = float(np.mean(non_zero))
+    std_nz = float(np.std(non_zero, ddof=0))
     cv2 = (std_nz / mean_nz) ** 2 if mean_nz != 0 else float("inf")
     return float(adi), float(cv2)
 
@@ -109,14 +92,6 @@ def detect_demand_pattern(series: List[float]) -> str:
     if adi <= 1.32 and cv2 > 0.49:
         return "erratic"
     return "smooth"
-
-
-def has_seasonality_candidate(series: List[float], seasonal_periods: int = 12) -> bool:
-    """
-    Einfache Heuristik:
-    Saisonale Modelle erst ab 2 vollen Saisons testen.
-    """
-    return len(series) >= seasonal_periods * 2
 
 
 # =========================================================
@@ -169,19 +144,20 @@ def naive_forecast(train: List[float], periods: int) -> List[float]:
 def seasonal_naive_forecast(train: List[float], periods: int, season_length: int = 12) -> List[float]:
     if len(train) < season_length:
         raise ValueError("Zu wenig Historie für seasonal_naive.")
+
     history = list(map(float, train))
-    forecasts = []
+    forecasts: List[float] = []
+
     for i in range(periods):
-        forecasts.append(history[-season_length + (i % season_length)])
+        idx = len(history) - season_length + (i % season_length)
+        forecasts.append(history[idx])
+
     return forecasts
 
 
 def moving_average_forecast(train: List[float], periods: int, window: int = 3) -> List[float]:
-    """
-    Iterativer Moving Average Forecast.
-    """
     history = list(map(float, train))
-    forecasts = []
+    forecasts: List[float] = []
 
     for _ in range(periods):
         effective_window = min(window, len(history))
@@ -193,17 +169,20 @@ def moving_average_forecast(train: List[float], periods: int, window: int = 3) -
 
 
 def ets_forecast(train: List[float], periods: int) -> List[float]:
-    """
-    Simple Exponential Smoothing
-    """
-    model = SimpleExpSmoothing(np.asarray(train, dtype=float), initialization_method="estimated")
+    model = SimpleExpSmoothing(
+        np.asarray(train, dtype=float),
+        initialization_method="estimated",
+    )
     fit = model.fit(optimized=True)
     fc = fit.forecast(periods)
     return [float(x) for x in fc]
 
 
 def holt_forecast(train: List[float], periods: int) -> List[float]:
-    model = Holt(np.asarray(train, dtype=float), initialization_method="estimated")
+    model = Holt(
+        np.asarray(train, dtype=float),
+        initialization_method="estimated",
+    )
     fit = model.fit(optimized=True)
     fc = fit.forecast(periods)
     return [float(x) for x in fc]
@@ -212,6 +191,7 @@ def holt_forecast(train: List[float], periods: int) -> List[float]:
 def holt_winters_forecast(train: List[float], periods: int, season_length: int = 12) -> List[float]:
     if len(train) < season_length * 2:
         raise ValueError("Zu wenig Historie für Holt-Winters.")
+
     model = ExponentialSmoothing(
         np.asarray(train, dtype=float),
         trend="add",
@@ -224,7 +204,7 @@ def holt_winters_forecast(train: List[float], periods: int, season_length: int =
     return [float(x) for x in fc]
 
 
-def arima_forecast(train: List[float], periods: int, order=(1, 1, 1)) -> List[float]:
+def arima_forecast(train: List[float], periods: int, order: Tuple[int, int, int] = (1, 1, 1)) -> List[float]:
     model = SARIMAX(
         np.asarray(train, dtype=float),
         order=order,
@@ -237,9 +217,15 @@ def arima_forecast(train: List[float], periods: int, order=(1, 1, 1)) -> List[fl
     return [float(x) for x in fc]
 
 
-def sarima_forecast(train: List[float], periods: int, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12)) -> List[float]:
+def sarima_forecast(
+    train: List[float],
+    periods: int,
+    order: Tuple[int, int, int] = (1, 1, 1),
+    seasonal_order: Tuple[int, int, int, int] = (1, 1, 1, 12),
+) -> List[float]:
     if len(train) < 24:
         raise ValueError("Zu wenig Historie für SARIMA.")
+
     model = SARIMAX(
         np.asarray(train, dtype=float),
         order=order,
@@ -253,30 +239,27 @@ def sarima_forecast(train: List[float], periods: int, order=(1, 1, 1), seasonal_
 
 
 def croston_forecast(train: List[float], periods: int, alpha: float = 0.1) -> List[float]:
-    """
-    Croston für intermittierende Nachfrage.
-    """
     ts = np.asarray(train, dtype=float)
-    demand = []
-    intervals = []
+    demand_sizes: List[float] = []
+    intervals: List[int] = []
 
     interval = 1
     for x in ts:
         if x > 0:
-            demand.append(x)
+            demand_sizes.append(float(x))
             intervals.append(interval)
             interval = 1
         else:
             interval += 1
 
-    if len(demand) == 0:
+    if len(demand_sizes) == 0:
         return [0.0] * periods
 
-    z = demand[0]
+    z = demand_sizes[0]
     p = float(intervals[0])
 
-    for i in range(1, len(demand)):
-        z = alpha * demand[i] + (1 - alpha) * z
+    for i in range(1, len(demand_sizes)):
+        z = alpha * demand_sizes[i] + (1 - alpha) * z
         p = alpha * intervals[i] + (1 - alpha) * p
 
     f = float(z / p) if p != 0 else 0.0
@@ -284,33 +267,25 @@ def croston_forecast(train: List[float], periods: int, alpha: float = 0.1) -> Li
 
 
 def sba_forecast(train: List[float], periods: int, alpha: float = 0.1) -> List[float]:
-    """
-    Syntetos-Boylan Approximation:
-    SBA = Croston * (1 - alpha/2)
-    """
     croston_fc = croston_forecast(train, periods, alpha=alpha)
     correction = 1 - alpha / 2
     return [float(x * correction) for x in croston_fc]
 
 
 def tsb_forecast(train: List[float], periods: int, alpha: float = 0.2, beta: float = 0.2) -> List[float]:
-    """
-    TSB (Teunter-Syntetos-Babai):
-    glättet Nachfragehöhe und Auftretenswahrscheinlichkeit.
-    """
     ts = np.asarray(train, dtype=float)
 
     if len(ts) == 0:
         return [0.0] * periods
 
-    demand_occurrence = np.where(ts > 0, 1.0, 0.0)
-
-    first_nonzero_idx = np.argmax(ts > 0) if np.any(ts > 0) else None
-    if first_nonzero_idx is None or np.all(ts == 0):
+    if np.all(ts == 0):
         return [0.0] * periods
 
-    z = float(ts[first_nonzero_idx])  # demand size estimate
-    p = float(demand_occurrence[first_nonzero_idx])  # occurrence probability
+    occurrence = np.where(ts > 0, 1.0, 0.0)
+    first_nonzero_idx = int(np.argmax(ts > 0))
+
+    z = float(ts[first_nonzero_idx])
+    p = float(occurrence[first_nonzero_idx])
 
     for x in ts[first_nonzero_idx + 1:]:
         occ = 1.0 if x > 0 else 0.0
@@ -323,20 +298,11 @@ def tsb_forecast(train: List[float], periods: int, alpha: float = 0.2, beta: flo
 
 
 def create_ml_features(series: List[float], season_length: int = 12) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Lag-basierte Features für Gradient Boosting.
-    Features:
-    - lag1, lag2, lag3, lag6, lag12
-    - rolling mean 3
-    - rolling mean 6
-    - month index (0..11)
-    """
     values = list(map(float, series))
-    rows = []
-    targets = []
+    rows: List[List[float]] = []
+    targets: List[float] = []
 
-    min_required = 12
-    if len(values) <= min_required:
+    if len(values) <= 12:
         raise ValueError("Zu wenig Historie für Gradient Boosting.")
 
     for t in range(12, len(values)):
@@ -347,7 +313,7 @@ def create_ml_features(series: List[float], season_length: int = 12) -> Tuple[np
         lag12 = values[t - 12]
         rmean3 = float(np.mean(values[t - 3:t]))
         rmean6 = float(np.mean(values[t - 6:t]))
-        month_idx = t % season_length
+        month_idx = float(t % season_length)
 
         rows.append([lag1, lag2, lag3, lag6, lag12, rmean3, rmean6, month_idx])
         targets.append(values[t])
@@ -364,9 +330,9 @@ def gradient_boosting_forecast(train: List[float], periods: int, season_length: 
     model.fit(X, y)
 
     history = list(map(float, train))
-    forecasts = []
+    forecasts: List[float] = []
 
-    for step in range(periods):
+    for _ in range(periods):
         t = len(history)
         lag1 = history[t - 1]
         lag2 = history[t - 2]
@@ -375,7 +341,7 @@ def gradient_boosting_forecast(train: List[float], periods: int, season_length: 
         lag12 = history[t - 12]
         rmean3 = float(np.mean(history[t - 3:t]))
         rmean6 = float(np.mean(history[t - 6:t]))
-        month_idx = t % season_length
+        month_idx = float(t % season_length)
 
         x_new = np.asarray([[lag1, lag2, lag3, lag6, lag12, rmean3, rmean6, month_idx]])
         pred = float(model.predict(x_new)[0])
@@ -411,6 +377,7 @@ def run_model(model_name: str, train: List[float], periods: int) -> List[float]:
         return tsb_forecast(train, periods, alpha=0.2, beta=0.2)
     if model_name == "gradient_boosting":
         return gradient_boosting_forecast(train, periods, season_length=12)
+
     raise ValueError(f"Unbekanntes Modell: {model_name}")
 
 
@@ -446,6 +413,7 @@ def model_is_allowed(model_name: str, train: List[float], pattern: str) -> bool:
         return pattern in ("intermittent", "lumpy") and non_zero >= 2
     if model_name == "gradient_boosting":
         return n >= 24
+
     return False
 
 
@@ -453,8 +421,12 @@ def model_is_allowed(model_name: str, train: List[float], pattern: str) -> bool:
 # Rolling backtesting
 # =========================================================
 
-def generate_rolling_splits(series: List[float], n_splits: int = 3, horizon: int = 1) -> List[Tuple[List[float], List[float]]]:
-    splits = []
+def generate_rolling_splits(
+    series: List[float],
+    n_splits: int = 3,
+    horizon: int = 1,
+) -> List[Tuple[List[float], List[float]]]:
+    splits: List[Tuple[List[float], List[float]]] = []
     n = len(series)
     last_test_start = n - horizon
 
@@ -473,13 +445,19 @@ def generate_rolling_splits(series: List[float], n_splits: int = 3, horizon: int
     return splits
 
 
-def evaluate_model_rolling(series: List[float], model_name: str, pattern: str, n_splits: int = 3, horizon: int = 1) -> Dict[str, Any]:
+def evaluate_model_rolling(
+    series: List[float],
+    model_name: str,
+    pattern: str,
+    n_splits: int = 3,
+    horizon: int = 1,
+) -> Dict[str, Any]:
     splits = generate_rolling_splits(series, n_splits=n_splits, horizon=horizon)
 
     if not splits:
         raise ValueError("Zu wenig Historie für Rolling Backtesting.")
 
-    split_results = []
+    split_results: List[Dict[str, Any]] = []
 
     for idx, (train, test) in enumerate(splits, start=1):
         if not model_is_allowed(model_name, train, pattern):
@@ -542,20 +520,21 @@ def choose_best_model(series: List[float], pattern: str) -> Dict[str, Any]:
         "gradient_boosting",
     ]
 
-    valid_models = [m for m in candidate_models if model_is_allowed(m, series[:-1] if len(series) > 1 else series, pattern)]
+    ref_series = series[:-1] if len(series) > 1 else series
+    valid_models = [m for m in candidate_models if model_is_allowed(m, ref_series, pattern)]
 
     if not valid_models:
         raise ValueError("Keine zulässigen Modelle verfügbar.")
 
-    results = []
-    excluded_models = []
+    results: List[Dict[str, Any]] = []
+    excluded_models: List[Dict[str, str]] = []
 
     for model_name in valid_models:
         try:
             result = evaluate_model_rolling(series, model_name, pattern, n_splits=3, horizon=1)
             results.append(result)
-        except Exception as e:
-            excluded_models.append({"model": model_name, "reason": str(e)})
+        except Exception as exc:
+            excluded_models.append({"model": model_name, "reason": str(exc)})
 
     if not results:
         raise ValueError("Kein Modell konnte erfolgreich bewertet werden.")
@@ -581,12 +560,12 @@ def choose_best_model(series: List[float], pattern: str) -> Dict[str, Any]:
 # =========================================================
 
 @app.get("/")
-def root():
+def root() -> Dict[str, str]:
     return {"status": "ok", "message": "Demand Forecast API läuft"}
 
 
 @app.post("/forecast")
-def forecast(req: ForecastRequest):
+def forecast(req: ForecastRequest) -> Dict[str, Any]:
     try:
         validate_inputs(req.demand, req.stockout, req.periods)
         cleaned = clean_demand(req.demand, req.stockout)
@@ -652,7 +631,8 @@ def forecast(req: ForecastRequest):
             ranking = selection["ranking"]
             excluded_models = selection["excluded_models"]
         else:
-            if not model_is_allowed(req.model, cleaned[:-1] if len(cleaned) > 1 else cleaned, pattern):
+            ref_series = cleaned[:-1] if len(cleaned) > 1 else cleaned
+            if not model_is_allowed(req.model, ref_series, pattern):
                 raise ValueError(f"Modell '{req.model}' ist für diese Zeitreihe nicht zulässig.")
 
             evaluation = evaluate_model_rolling(cleaned, req.model, pattern, n_splits=3, horizon=1)
@@ -688,10 +668,10 @@ def forecast(req: ForecastRequest):
             "excluded_models": excluded_models,
         }
 
-    except Exception as e:
+    except Exception as exc:
         return {
             "sku": req.sku,
             "status": "failed",
             "reason": "forecast_error",
-            "details": str(e),
+            "details": str(exc),
         }
