@@ -12,15 +12,33 @@ from sklearn.ensemble import (
     HistGradientBoostingRegressor,
 )
 from sklearn.neural_network import MLPRegressor
-from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.holtwinters import ExponentialSmoothing, Holt, SimpleExpSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="Demand Forecast API", version="7.1.0")
+app = FastAPI(title="Demand Forecast API", version="7.2.0")
 
+# =========================================================
+# Feste saisonale Faktoren
+# Monat 1 = Januar
+# =========================================================
+SEASONAL_FACTORS: Dict[int, float] = {
+    1: 1.00,
+    2: 0.86,
+    3: 1.03,
+    4: 1.20,
+    5: 1.16,
+    6: 1.26,
+    7: 1.28,
+    8: 1.19,
+    9: 1.08,
+    10: 1.05,
+    11: 0.93,
+    12: 0.57,
+}
 
 AllowedModel = Literal[
     "auto",
@@ -44,27 +62,52 @@ AllowedModel = Literal[
 
 
 class ForecastRequest(BaseModel):
-    sku: str
-    demand: List[float]
+    sku: str = Field(..., min_length=1, max_length=100)
+    demand: List[float] = Field(..., min_length=1)
     periods: int = Field(default=15, ge=1, le=24)
-    model: Optional[AllowedModel] = "auto"
+    model: AllowedModel = "auto"
     locked_model: Optional[AllowedModel] = None
     evaluation_horizon: int = Field(default=6, ge=1, le=15)
     n_splits: int = Field(default=3, ge=1, le=6)
     season_length: int = Field(default=12, ge=2, le=24)
+    yearly_trend: float = Field(default=0.0, ge=-0.95, le=5.0)
+    forecast_start_month: int = Field(default=1, ge=1, le=12)
 
 
 # =========================================================
 # Validation & preprocessing
 # =========================================================
 
-def validate_inputs(demand: List[float], periods: int, evaluation_horizon: int) -> None:
+def validate_inputs(
+    demand: List[float],
+    periods: int,
+    evaluation_horizon: int,
+    n_splits: int,
+    season_length: int,
+) -> None:
     if len(demand) == 0:
         raise ValueError("demand darf nicht leer sein.")
+
+    if not all(isinstance(x, (int, float)) for x in demand):
+        raise ValueError("Alle demand-Werte müssen numerisch sein.")
+
+    if any(not math.isfinite(float(x)) for x in demand):
+        raise ValueError("demand enthält ungültige Werte (NaN oder Infinity).")
+
     if periods < 1:
         raise ValueError("periods muss >= 1 sein.")
+
     if evaluation_horizon < 1:
         raise ValueError("evaluation_horizon muss >= 1 sein.")
+
+    if n_splits < 1:
+        raise ValueError("n_splits muss >= 1 sein.")
+
+    if season_length < 2:
+        raise ValueError("season_length muss >= 2 sein.")
+
+    if len(demand) < 2:
+        raise ValueError("Für eine Prognose werden mindestens 2 Werte benötigt.")
 
 
 def clip_non_negative(values: List[float]) -> List[float]:
@@ -87,19 +130,19 @@ def robust_mad(x: np.ndarray) -> float:
 
 def detect_outliers_robust(series: List[float]) -> List[int]:
     """
-    Robuste Outlier-Erkennung:
-    - negative Werte -> Flag
-    - robuste Z-Scores via Median/MAD
-    - lokale harte Sprünge
-    - verdächtige Nullen als möglicher Stockout / verdeckter Bedarf
+    Erkennt mögliche Ausreißer:
+    - negative Werte
+    - globale Ausreißer über Median/MAD
+    - lokale abrupte Sprünge
+    - verdächtige isolierte Nullen
     """
     arr = np.asarray(series, dtype=float)
     flags = np.zeros(len(arr), dtype=int)
 
-    # negative Werte markieren
+    # negative Werte sind unplausibel
     flags[arr < 0] = 1
 
-    # Statistik ohne Nullen, damit 0-Werte die Demand-Basis nicht verzerren
+    # Basisstatistik ohne Nullwerte
     non_zero = arr[arr > 0]
     if len(non_zero) < 3:
         return flags.tolist()
@@ -107,13 +150,13 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
     med = float(np.median(non_zero))
     mad = robust_mad(non_zero)
 
-    # globale robuste Ausreißererkennung
+    # globale robuste Ausreißer
     if mad > 0:
         robust_z = 0.6745 * (arr - med) / mad
         robust_mask = np.abs(robust_z) > 3.5
         flags[robust_mask] = 1
 
-    # lokale Peaks / Einbrüche + verdächtige Nullen
+    # lokale Peaks / Einbrüche und isolierte Nullen
     for i in range(1, len(arr) - 1):
         prev_v = arr[i - 1]
         curr_v = arr[i]
@@ -126,7 +169,6 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
             if ratio > 4.0 or ratio < 0.2:
                 flags[i] = 1
 
-        # isolierte 0 in sonst positivem Umfeld -> verdächtig
         if curr_v == 0:
             local_avg = (prev_v + next_v) / 2.0
             if local_avg > med * 0.5:
@@ -137,8 +179,8 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
 
 def impute_series(series: List[float], outlier_flags: List[int]) -> List[float]:
     """
-    Ausreißer/verdächtige Werte werden als fehlend behandelt und interpoliert.
-    Nicht pauschal auf 0 setzen.
+    Markierte Werte werden als fehlend interpretiert und interpoliert.
+    Nicht pauschal als 0 setzen.
     """
     arr = np.asarray(series, dtype=float)
 
@@ -442,6 +484,7 @@ def recursive_ml_forecast(model, train: List[float], periods: int, season_length
 
     for _ in range(periods):
         t = len(history)
+
         lag1 = history[t - 1]
         lag2 = history[t - 2]
         lag3 = history[t - 3]
@@ -541,6 +584,31 @@ def mlp_forecast(train: List[float], periods: int, season_length: int = 12) -> L
     )
     model.fit(X, y)
     return recursive_ml_forecast(model, train, periods, season_length=season_length)
+
+
+# =========================================================
+# Business adjustments
+# =========================================================
+
+def apply_business_adjustments(
+    forecast: List[float],
+    start_month: int,
+    seasonal_factors: Dict[int, float],
+    yearly_trend: float = 0.0,
+) -> List[float]:
+    adjusted: List[float] = []
+
+    for i, value in enumerate(forecast):
+        month = ((start_month - 1 + i) % 12) + 1
+        season_factor = float(seasonal_factors.get(month, 1.0))
+
+        # kumulierter Trend auf Monatsbasis aus Jahresfaktor
+        monthly_trend_factor = (1.0 + yearly_trend) ** (i / 12.0)
+
+        new_val = float(value) * season_factor * monthly_trend_factor
+        adjusted.append(max(0.0, new_val))
+
+    return adjusted
 
 
 # =========================================================
@@ -667,11 +735,12 @@ def evaluate_model_rolling(
     horizon: int = 6,
     season_length: int = 12,
 ) -> Dict[str, Any]:
+    min_train_size = max(6, min(season_length, max(6, len(series) - horizon - 1)))
     splits = generate_rolling_splits(
         series=series,
         n_splits=n_splits,
         horizon=horizon,
-        min_train_size=max(6, min(season_length, len(series) - horizon - 1)) if len(series) > horizon + 1 else 6,
+        min_train_size=min_train_size,
     )
 
     if not splits:
@@ -803,10 +872,21 @@ def root() -> Dict[str, str]:
     return {"status": "ok", "message": "Demand Forecast API läuft"}
 
 
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "healthy"}
+
+
 @app.post("/forecast")
 def forecast(req: ForecastRequest) -> Dict[str, Any]:
     try:
-        validate_inputs(req.demand, req.periods, req.evaluation_horizon)
+        validate_inputs(
+            demand=req.demand,
+            periods=req.periods,
+            evaluation_horizon=req.evaluation_horizon,
+            n_splits=req.n_splits,
+            season_length=req.season_length,
+        )
 
         prep = preprocess_demand(req.demand)
         cleaned = prep["cleaned"]
@@ -826,6 +906,10 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
                 "backtest_config": {"splits": 0, "horizon": 0},
                 "model_ranking": [],
                 "excluded_models": [],
+                "preprocessing": {
+                    "original": prep["original"],
+                    "cleaned": [],
+                },
             }
 
         if count_nonzero(cleaned) == 0:
@@ -839,6 +923,7 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
                     "adi": None,
                     "cv2": None,
                     "outlier_count": prep["outlier_count"],
+                    "outlier_flags": prep["outlier_flags"],
                 },
                 "backtest_config": {"splits": 0, "horizon": 0},
                 "model_ranking": [],
@@ -856,6 +941,12 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
         if len(cleaned) < 4:
             selected_model = "naive"
             final_forecast = naive_forecast(cleaned, req.periods)
+            final_forecast = apply_business_adjustments(
+                forecast=final_forecast,
+                start_month=req.forecast_start_month,
+                seasonal_factors=SEASONAL_FACTORS,
+                yearly_trend=req.yearly_trend,
+            )
 
             return {
                 "sku": req.sku,
@@ -883,6 +974,12 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
         if len(cleaned) < 8 and req.model == "auto" and req.locked_model is None:
             selected_model = "ets" if model_is_allowed("ets", cleaned, pattern, req.season_length) else "naive"
             final_forecast = run_model(selected_model, cleaned, req.periods, season_length=req.season_length)
+            final_forecast = apply_business_adjustments(
+                forecast=final_forecast,
+                start_month=req.forecast_start_month,
+                seasonal_factors=SEASONAL_FACTORS,
+                yearly_trend=req.yearly_trend,
+            )
 
             return {
                 "sku": req.sku,
@@ -959,6 +1056,12 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
             excluded_models = []
 
         final_forecast = run_model(selected_model, cleaned, req.periods, season_length=req.season_length)
+        final_forecast = apply_business_adjustments(
+            forecast=final_forecast,
+            start_month=req.forecast_start_month,
+            seasonal_factors=SEASONAL_FACTORS,
+            yearly_trend=req.yearly_trend,
+        )
 
         return {
             "sku": req.sku,
@@ -977,6 +1080,8 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
                 "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
                 "outlier_count": prep["outlier_count"],
                 "outlier_flags": prep["outlier_flags"],
+                "yearly_trend": req.yearly_trend,
+                "forecast_start_month": req.forecast_start_month,
             },
             "backtest_config": backtest_config,
             "model_ranking": [
