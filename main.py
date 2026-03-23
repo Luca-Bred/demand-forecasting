@@ -1,15 +1,18 @@
 from typing import Any, Dict, List, Literal, Optional, Tuple
+import io
 import math
 import warnings
 
 import numpy as np
-from fastapi import FastAPI
+import pandas as pd
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sklearn.ensemble import (
-    GradientBoostingRegressor,
-    RandomForestRegressor,
     ExtraTreesRegressor,
+    GradientBoostingRegressor,
     HistGradientBoostingRegressor,
+    RandomForestRegressor,
 )
 from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import Pipeline
@@ -19,11 +22,10 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="Demand Forecast API", version="7.2.0")
+app = FastAPI(title="Demand Forecast API", version="8.1.0")
 
 # =========================================================
 # Feste saisonale Faktoren
-# Monat 1 = Januar
 # =========================================================
 SEASONAL_FACTORS: Dict[int, float] = {
     1: 1.00,
@@ -87,27 +89,20 @@ def validate_inputs(
 ) -> None:
     if len(demand) == 0:
         raise ValueError("demand darf nicht leer sein.")
-
-    if not all(isinstance(x, (int, float)) for x in demand):
-        raise ValueError("Alle demand-Werte müssen numerisch sein.")
-
-    if any(not math.isfinite(float(x)) for x in demand):
-        raise ValueError("demand enthält ungültige Werte (NaN oder Infinity).")
-
-    if periods < 1:
-        raise ValueError("periods muss >= 1 sein.")
-
-    if evaluation_horizon < 1:
-        raise ValueError("evaluation_horizon muss >= 1 sein.")
-
-    if n_splits < 1:
-        raise ValueError("n_splits muss >= 1 sein.")
-
-    if season_length < 2:
-        raise ValueError("season_length muss >= 2 sein.")
-
     if len(demand) < 2:
         raise ValueError("Für eine Prognose werden mindestens 2 Werte benötigt.")
+    if not all(isinstance(x, (int, float)) for x in demand):
+        raise ValueError("Alle demand-Werte müssen numerisch sein.")
+    if any(not math.isfinite(float(x)) for x in demand):
+        raise ValueError("demand enthält ungültige Werte (NaN oder Infinity).")
+    if periods < 1:
+        raise ValueError("periods muss >= 1 sein.")
+    if evaluation_horizon < 1:
+        raise ValueError("evaluation_horizon muss >= 1 sein.")
+    if n_splits < 1:
+        raise ValueError("n_splits muss >= 1 sein.")
+    if season_length < 2:
+        raise ValueError("season_length muss >= 2 sein.")
 
 
 def clip_non_negative(values: List[float]) -> List[float]:
@@ -142,7 +137,6 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
     # negative Werte sind unplausibel
     flags[arr < 0] = 1
 
-    # Basisstatistik ohne Nullwerte
     non_zero = arr[arr > 0]
     if len(non_zero) < 3:
         return flags.tolist()
@@ -150,20 +144,17 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
     med = float(np.median(non_zero))
     mad = robust_mad(non_zero)
 
-    # globale robuste Ausreißer
     if mad > 0:
         robust_z = 0.6745 * (arr - med) / mad
         robust_mask = np.abs(robust_z) > 3.5
         flags[robust_mask] = 1
 
-    # lokale Peaks / Einbrüche und isolierte Nullen
     for i in range(1, len(arr) - 1):
         prev_v = arr[i - 1]
         curr_v = arr[i]
         next_v = arr[i + 1]
 
         local_med = float(np.median([prev_v, next_v]))
-
         if local_med > 0:
             ratio = curr_v / local_med
             if ratio > 4.0 or ratio < 0.2:
@@ -179,8 +170,7 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
 
 def impute_series(series: List[float], outlier_flags: List[int]) -> List[float]:
     """
-    Markierte Werte werden als fehlend interpretiert und interpoliert.
-    Nicht pauschal als 0 setzen.
+    Markierte Werte werden als fehlend behandelt und interpoliert.
     """
     arr = np.asarray(series, dtype=float)
 
@@ -601,8 +591,6 @@ def apply_business_adjustments(
     for i, value in enumerate(forecast):
         month = ((start_month - 1 + i) % 12) + 1
         season_factor = float(seasonal_factors.get(month, 1.0))
-
-        # kumulierter Trend auf Monatsbasis aus Jahresfaktor
         monthly_trend_factor = (1.0 + yearly_trend) ** (i / 12.0)
 
         new_val = float(value) * season_factor * monthly_trend_factor
@@ -864,6 +852,357 @@ def choose_best_model(
 
 
 # =========================================================
+# Forecast core
+# =========================================================
+
+def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
+    validate_inputs(
+        demand=req.demand,
+        periods=req.periods,
+        evaluation_horizon=req.evaluation_horizon,
+        n_splits=req.n_splits,
+        season_length=req.season_length,
+    )
+
+    prep = preprocess_demand(req.demand)
+    cleaned = prep["cleaned"]
+
+    if len(cleaned) == 0:
+        return {
+            "sku": req.sku,
+            "model": "no_forecast",
+            "forecast": [],
+            "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
+            "analysis": {
+                "demand_pattern": "no_demand",
+                "adi": None,
+                "cv2": None,
+                "outlier_count": prep["outlier_count"],
+                "outlier_flags": prep["outlier_flags"],
+                "yearly_trend": req.yearly_trend,
+                "forecast_start_month": req.forecast_start_month,
+            },
+            "backtest_config": {"splits": 0, "horizon": 0},
+            "model_ranking": [],
+            "excluded_models": [],
+            "preprocessing": {"original": prep["original"], "cleaned": []},
+        }
+
+    if count_nonzero(cleaned) == 0:
+        return {
+            "sku": req.sku,
+            "model": "no_forecast",
+            "forecast": [0] * req.periods,
+            "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
+            "analysis": {
+                "demand_pattern": "all_zero",
+                "adi": None,
+                "cv2": None,
+                "outlier_count": prep["outlier_count"],
+                "outlier_flags": prep["outlier_flags"],
+                "yearly_trend": req.yearly_trend,
+                "forecast_start_month": req.forecast_start_month,
+            },
+            "backtest_config": {"splits": 0, "horizon": 0},
+            "model_ranking": [],
+            "excluded_models": [],
+            "preprocessing": {
+                "original": prep["original"],
+                "cleaned": [round(x, 2) for x in cleaned],
+            },
+        }
+
+    pattern = detect_demand_pattern(cleaned)
+    adi, cv2 = compute_adi_cv2(cleaned)
+
+    if len(cleaned) < 4:
+        selected_model = "naive"
+        final_forecast = naive_forecast(cleaned, req.periods)
+        final_forecast = apply_business_adjustments(
+            forecast=final_forecast,
+            start_month=req.forecast_start_month,
+            seasonal_factors=SEASONAL_FACTORS,
+            yearly_trend=req.yearly_trend,
+        )
+
+        return {
+            "sku": req.sku,
+            "model": selected_model,
+            "model_changed": False,
+            "forecast": round_forecast(final_forecast),
+            "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
+            "analysis": {
+                "demand_pattern": pattern,
+                "adi": round(adi, 4) if math.isfinite(adi) else None,
+                "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
+                "outlier_count": prep["outlier_count"],
+                "outlier_flags": prep["outlier_flags"],
+                "yearly_trend": req.yearly_trend,
+                "forecast_start_month": req.forecast_start_month,
+            },
+            "backtest_config": {"splits": 0, "horizon": 0},
+            "model_ranking": [],
+            "excluded_models": [],
+            "preprocessing": {
+                "original": prep["original"],
+                "cleaned": [round(x, 2) for x in cleaned],
+            },
+        }
+
+    if len(cleaned) < 8 and req.model == "auto" and req.locked_model is None:
+        selected_model = "ets" if model_is_allowed("ets", cleaned, pattern, req.season_length) else "naive"
+        final_forecast = run_model(selected_model, cleaned, req.periods, season_length=req.season_length)
+        final_forecast = apply_business_adjustments(
+            forecast=final_forecast,
+            start_month=req.forecast_start_month,
+            seasonal_factors=SEASONAL_FACTORS,
+            yearly_trend=req.yearly_trend,
+        )
+
+        return {
+            "sku": req.sku,
+            "model": selected_model,
+            "model_changed": False,
+            "forecast": round_forecast(final_forecast),
+            "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
+            "analysis": {
+                "demand_pattern": pattern,
+                "adi": round(adi, 4) if math.isfinite(adi) else None,
+                "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
+                "outlier_count": prep["outlier_count"],
+                "outlier_flags": prep["outlier_flags"],
+                "yearly_trend": req.yearly_trend,
+                "forecast_start_month": req.forecast_start_month,
+            },
+            "backtest_config": {"splits": 0, "horizon": 0},
+            "model_ranking": [],
+            "excluded_models": [],
+            "preprocessing": {
+                "original": prep["original"],
+                "cleaned": [round(x, 2) for x in cleaned],
+            },
+        }
+
+    model_changed = False
+
+    if req.locked_model and req.locked_model != "auto":
+        if not model_is_allowed(req.locked_model, cleaned, pattern, req.season_length):
+            raise ValueError(f"locked_model '{req.locked_model}' ist für diese Zeitreihe nicht zulässig.")
+
+        evaluation = evaluate_model_rolling(
+            series=cleaned,
+            model_name=req.locked_model,
+            pattern=pattern,
+            n_splits=req.n_splits,
+            horizon=req.evaluation_horizon,
+            season_length=req.season_length,
+        )
+        selected_model = req.locked_model
+        backtest_metrics = evaluation["metrics"]
+        backtest_config = evaluation["backtest_config"]
+        ranking = [evaluation]
+        excluded_models = []
+
+    elif req.model == "auto":
+        selection = choose_best_model(
+            series=cleaned,
+            pattern=pattern,
+            n_splits=req.n_splits,
+            horizon=req.evaluation_horizon,
+            season_length=req.season_length,
+        )
+        selected_model = selection["best"]["model"]
+        backtest_metrics = selection["best"]["metrics"]
+        backtest_config = selection["best"]["backtest_config"]
+        ranking = selection["ranking"]
+        excluded_models = selection["excluded_models"]
+
+    else:
+        if not model_is_allowed(req.model, cleaned, pattern, req.season_length):
+            raise ValueError(f"Modell '{req.model}' ist für diese Zeitreihe nicht zulässig.")
+
+        evaluation = evaluate_model_rolling(
+            series=cleaned,
+            model_name=req.model,
+            pattern=pattern,
+            n_splits=req.n_splits,
+            horizon=req.evaluation_horizon,
+            season_length=req.season_length,
+        )
+        selected_model = req.model
+        backtest_metrics = evaluation["metrics"]
+        backtest_config = evaluation["backtest_config"]
+        ranking = [evaluation]
+        excluded_models = []
+
+    final_forecast = run_model(selected_model, cleaned, req.periods, season_length=req.season_length)
+    final_forecast = apply_business_adjustments(
+        forecast=final_forecast,
+        start_month=req.forecast_start_month,
+        seasonal_factors=SEASONAL_FACTORS,
+        yearly_trend=req.yearly_trend,
+    )
+
+    return {
+        "sku": req.sku,
+        "model": selected_model,
+        "model_changed": model_changed,
+        "forecast": round_forecast(final_forecast),
+        "metrics": {
+            "mae": round(backtest_metrics["mae"], 2),
+            "wape": round(backtest_metrics["wape"], 4),
+            "mase": round(backtest_metrics["mase"], 4),
+            "bias": round(backtest_metrics["bias"], 2),
+        },
+        "analysis": {
+            "demand_pattern": pattern,
+            "adi": round(adi, 4) if math.isfinite(adi) else None,
+            "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
+            "outlier_count": prep["outlier_count"],
+            "outlier_flags": prep["outlier_flags"],
+            "yearly_trend": req.yearly_trend,
+            "forecast_start_month": req.forecast_start_month,
+        },
+        "backtest_config": backtest_config,
+        "model_ranking": [
+            {
+                "model": item["model"],
+                "mae": round(item["metrics"]["mae"], 2),
+                "wape": round(item["metrics"]["wape"], 4),
+                "mase": round(item["metrics"]["mase"], 4),
+                "bias": round(item["metrics"]["bias"], 2),
+            }
+            for item in ranking
+        ],
+        "excluded_models": excluded_models,
+        "preprocessing": {
+            "original": prep["original"],
+            "cleaned": [round(x, 2) for x in cleaned],
+        },
+    }
+
+
+# =========================================================
+# File helpers
+# =========================================================
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def detect_required_columns(df: pd.DataFrame) -> Tuple[str, str]:
+    """
+    Erwartet Pflichtspalten:
+    - SKU
+    - Verbrauch
+
+    Zulässige Aliasnamen:
+    SKU: SKU, sku, Artikel, artikel
+    Verbrauch: Verbrauch, verbrauch, Demand, demand, Menge, menge
+    """
+    col_map = {c.lower(): c for c in df.columns}
+
+    sku_candidates = ["sku", "artikel"]
+    demand_candidates = ["verbrauch", "demand", "menge"]
+
+    sku_col = None
+    demand_col = None
+
+    for c in sku_candidates:
+        if c in col_map:
+            sku_col = col_map[c]
+            break
+
+    for c in demand_candidates:
+        if c in col_map:
+            demand_col = col_map[c]
+            break
+
+    if sku_col is None or demand_col is None:
+        raise ValueError(
+            "Datei muss Spalten für SKU und Verbrauch enthalten. "
+            "Erlaubte Namen: SKU/Artikel und Verbrauch/Demand/Menge."
+        )
+
+    return sku_col, demand_col
+
+
+def read_input_file(file: UploadFile) -> pd.DataFrame:
+    filename = (file.filename or "").lower()
+
+    if filename.endswith(".csv"):
+        return pd.read_csv(file.file)
+    if filename.endswith(".xlsx"):
+        return pd.read_excel(file.file)
+
+    raise ValueError("Nur CSV oder XLSX als Input erlaubt.")
+
+
+def build_output_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+
+    for result in results:
+        sku = result["sku"]
+        model = result.get("model", "")
+        metrics = result.get("metrics", {})
+        analysis = result.get("analysis", {})
+        ranking = result.get("model_ranking", [])
+
+        forecast_values = result.get("forecast", [])
+        for i, value in enumerate(forecast_values, start=1):
+            rows.append(
+                {
+                    "SKU": sku,
+                    "Forecast_Period": i,
+                    "Forecast": value,
+                    "Selected_Model": model,
+                    "MAE": metrics.get("mae"),
+                    "WAPE": metrics.get("wape"),
+                    "MASE": metrics.get("mase"),
+                    "BIAS": metrics.get("bias"),
+                    "Demand_Pattern": analysis.get("demand_pattern"),
+                    "ADI": analysis.get("adi"),
+                    "CV2": analysis.get("cv2"),
+                    "Outlier_Count": analysis.get("outlier_count"),
+                    "Yearly_Trend": analysis.get("yearly_trend"),
+                    "Forecast_Start_Month": analysis.get("forecast_start_month"),
+                    "Top_Ranked_Model": ranking[0]["model"] if ranking else model,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def dataframe_to_file_response(df: pd.DataFrame, output_format: str) -> StreamingResponse:
+    output_format = output_format.lower().strip()
+
+    if output_format == "csv":
+        buffer = io.StringIO()
+        df.to_csv(buffer, index=False)
+        buffer.seek(0)
+        return StreamingResponse(
+            io.BytesIO(buffer.getvalue().encode("utf-8")),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=forecast_output.csv"},
+        )
+
+    if output_format == "xlsx":
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Forecast")
+        buffer.seek(0)
+        return StreamingResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": "attachment; filename=forecast_output.xlsx"},
+        )
+
+    raise ValueError("output_format muss 'csv' oder 'xlsx' sein.")
+
+
+# =========================================================
 # API
 # =========================================================
 
@@ -880,231 +1219,73 @@ def health() -> Dict[str, str]:
 @app.post("/forecast")
 def forecast(req: ForecastRequest) -> Dict[str, Any]:
     try:
-        validate_inputs(
-            demand=req.demand,
-            periods=req.periods,
-            evaluation_horizon=req.evaluation_horizon,
-            n_splits=req.n_splits,
-            season_length=req.season_length,
-        )
-
-        prep = preprocess_demand(req.demand)
-        cleaned = prep["cleaned"]
-
-        if len(cleaned) == 0:
-            return {
-                "sku": req.sku,
-                "model": "no_forecast",
-                "forecast": [],
-                "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
-                "analysis": {
-                    "demand_pattern": "no_demand",
-                    "adi": None,
-                    "cv2": None,
-                    "outlier_count": prep["outlier_count"],
-                },
-                "backtest_config": {"splits": 0, "horizon": 0},
-                "model_ranking": [],
-                "excluded_models": [],
-                "preprocessing": {
-                    "original": prep["original"],
-                    "cleaned": [],
-                },
-            }
-
-        if count_nonzero(cleaned) == 0:
-            return {
-                "sku": req.sku,
-                "model": "no_forecast",
-                "forecast": [0] * req.periods,
-                "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
-                "analysis": {
-                    "demand_pattern": "all_zero",
-                    "adi": None,
-                    "cv2": None,
-                    "outlier_count": prep["outlier_count"],
-                    "outlier_flags": prep["outlier_flags"],
-                },
-                "backtest_config": {"splits": 0, "horizon": 0},
-                "model_ranking": [],
-                "excluded_models": [],
-                "preprocessing": {
-                    "original": prep["original"],
-                    "cleaned": [round(x, 2) for x in cleaned],
-                },
-            }
-
-        pattern = detect_demand_pattern(cleaned)
-        adi, cv2 = compute_adi_cv2(cleaned)
-
-        # Sehr kurze Historie
-        if len(cleaned) < 4:
-            selected_model = "naive"
-            final_forecast = naive_forecast(cleaned, req.periods)
-            final_forecast = apply_business_adjustments(
-                forecast=final_forecast,
-                start_month=req.forecast_start_month,
-                seasonal_factors=SEASONAL_FACTORS,
-                yearly_trend=req.yearly_trend,
-            )
-
-            return {
-                "sku": req.sku,
-                "model": selected_model,
-                "model_changed": False,
-                "forecast": round_forecast(final_forecast),
-                "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
-                "analysis": {
-                    "demand_pattern": pattern,
-                    "adi": round(adi, 4) if math.isfinite(adi) else None,
-                    "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
-                    "outlier_count": prep["outlier_count"],
-                    "outlier_flags": prep["outlier_flags"],
-                },
-                "backtest_config": {"splits": 0, "horizon": 0},
-                "model_ranking": [],
-                "excluded_models": [],
-                "preprocessing": {
-                    "original": prep["original"],
-                    "cleaned": [round(x, 2) for x in cleaned],
-                },
-            }
-
-        # Kurze Historie -> einfache Verfahren
-        if len(cleaned) < 8 and req.model == "auto" and req.locked_model is None:
-            selected_model = "ets" if model_is_allowed("ets", cleaned, pattern, req.season_length) else "naive"
-            final_forecast = run_model(selected_model, cleaned, req.periods, season_length=req.season_length)
-            final_forecast = apply_business_adjustments(
-                forecast=final_forecast,
-                start_month=req.forecast_start_month,
-                seasonal_factors=SEASONAL_FACTORS,
-                yearly_trend=req.yearly_trend,
-            )
-
-            return {
-                "sku": req.sku,
-                "model": selected_model,
-                "model_changed": False,
-                "forecast": round_forecast(final_forecast),
-                "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
-                "analysis": {
-                    "demand_pattern": pattern,
-                    "adi": round(adi, 4) if math.isfinite(adi) else None,
-                    "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
-                    "outlier_count": prep["outlier_count"],
-                    "outlier_flags": prep["outlier_flags"],
-                },
-                "backtest_config": {"splits": 0, "horizon": 0},
-                "model_ranking": [],
-                "excluded_models": [],
-                "preprocessing": {
-                    "original": prep["original"],
-                    "cleaned": [round(x, 2) for x in cleaned],
-                },
-            }
-
-        model_changed = False
-
-        if req.locked_model and req.locked_model != "auto":
-            if not model_is_allowed(req.locked_model, cleaned, pattern, req.season_length):
-                raise ValueError(f"locked_model '{req.locked_model}' ist für diese Zeitreihe nicht zulässig.")
-
-            evaluation = evaluate_model_rolling(
-                series=cleaned,
-                model_name=req.locked_model,
-                pattern=pattern,
-                n_splits=req.n_splits,
-                horizon=req.evaluation_horizon,
-                season_length=req.season_length,
-            )
-            selected_model = req.locked_model
-            backtest_metrics = evaluation["metrics"]
-            backtest_config = evaluation["backtest_config"]
-            ranking = [evaluation]
-            excluded_models = []
-
-        elif req.model == "auto":
-            selection = choose_best_model(
-                series=cleaned,
-                pattern=pattern,
-                n_splits=req.n_splits,
-                horizon=req.evaluation_horizon,
-                season_length=req.season_length,
-            )
-            selected_model = selection["best"]["model"]
-            backtest_metrics = selection["best"]["metrics"]
-            backtest_config = selection["best"]["backtest_config"]
-            ranking = selection["ranking"]
-            excluded_models = selection["excluded_models"]
-
-        else:
-            if not model_is_allowed(req.model, cleaned, pattern, req.season_length):
-                raise ValueError(f"Modell '{req.model}' ist für diese Zeitreihe nicht zulässig.")
-
-            evaluation = evaluate_model_rolling(
-                series=cleaned,
-                model_name=req.model,
-                pattern=pattern,
-                n_splits=req.n_splits,
-                horizon=req.evaluation_horizon,
-                season_length=req.season_length,
-            )
-            selected_model = req.model
-            backtest_metrics = evaluation["metrics"]
-            backtest_config = evaluation["backtest_config"]
-            ranking = [evaluation]
-            excluded_models = []
-
-        final_forecast = run_model(selected_model, cleaned, req.periods, season_length=req.season_length)
-        final_forecast = apply_business_adjustments(
-            forecast=final_forecast,
-            start_month=req.forecast_start_month,
-            seasonal_factors=SEASONAL_FACTORS,
-            yearly_trend=req.yearly_trend,
-        )
-
-        return {
-            "sku": req.sku,
-            "model": selected_model,
-            "model_changed": model_changed,
-            "forecast": round_forecast(final_forecast),
-            "metrics": {
-                "mae": round(backtest_metrics["mae"], 2),
-                "wape": round(backtest_metrics["wape"], 4),
-                "mase": round(backtest_metrics["mase"], 4),
-                "bias": round(backtest_metrics["bias"], 2),
-            },
-            "analysis": {
-                "demand_pattern": pattern,
-                "adi": round(adi, 4) if math.isfinite(adi) else None,
-                "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
-                "outlier_count": prep["outlier_count"],
-                "outlier_flags": prep["outlier_flags"],
-                "yearly_trend": req.yearly_trend,
-                "forecast_start_month": req.forecast_start_month,
-            },
-            "backtest_config": backtest_config,
-            "model_ranking": [
-                {
-                    "model": item["model"],
-                    "mae": round(item["metrics"]["mae"], 2),
-                    "wape": round(item["metrics"]["wape"], 4),
-                    "mase": round(item["metrics"]["mase"], 4),
-                    "bias": round(item["metrics"]["bias"], 2),
-                }
-                for item in ranking
-            ],
-            "excluded_models": excluded_models,
-            "preprocessing": {
-                "original": prep["original"],
-                "cleaned": [round(x, 2) for x in cleaned],
-            },
-        }
-
+        return compute_forecast_from_request(req)
     except Exception as exc:
         return {
-            "sku": req.sku,
+            "sku": req.sku if hasattr(req, "sku") else "",
             "status": "failed",
             "reason": "forecast_error",
             "details": str(exc),
         }
+
+
+@app.post("/forecast-file")
+async def forecast_file(
+    file: UploadFile = File(...),
+    yearly_trend: float = Form(0.0),
+    periods: int = Form(15),
+    model: str = Form("auto"),
+    locked_model: str = Form(""),
+    evaluation_horizon: int = Form(6),
+    n_splits: int = Form(3),
+    season_length: int = Form(12),
+    forecast_start_month: int = Form(1),
+    output_format: str = Form("xlsx"),
+):
+    try:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="Es wurde keine Datei übergeben.")
+
+        df = read_input_file(file)
+        df = normalize_columns(df)
+
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Die Eingabedatei ist leer.")
+
+        sku_col, demand_col = detect_required_columns(df)
+
+        df = df[[sku_col, demand_col]].copy()
+        df[demand_col] = pd.to_numeric(df[demand_col], errors="coerce")
+        df = df.dropna(subset=[sku_col, demand_col])
+
+        if df.empty:
+            raise HTTPException(status_code=400, detail="Keine verwertbaren Daten nach Bereinigung vorhanden.")
+
+        results: List[Dict[str, Any]] = []
+
+        for sku, group in df.groupby(sku_col, sort=False):
+            demand = group[demand_col].astype(float).tolist()
+
+            req = ForecastRequest(
+                sku=str(sku),
+                demand=demand,
+                periods=periods,
+                model=model,  # type: ignore[arg-type]
+                locked_model=locked_model if locked_model else None,  # type: ignore[arg-type]
+                evaluation_horizon=evaluation_horizon,
+                n_splits=n_splits,
+                season_length=season_length,
+                yearly_trend=yearly_trend,
+                forecast_start_month=forecast_start_month,
+            )
+
+            result = compute_forecast_from_request(req)
+            results.append(result)
+
+        result_df = build_output_dataframe(results)
+        return dataframe_to_file_response(result_df, output_format=output_format)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
