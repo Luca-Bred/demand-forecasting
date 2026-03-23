@@ -1,9 +1,9 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict, Any
 import math
 
-app = FastAPI(title="Demand Forecast API", version="2.0.0")
+app = FastAPI(title="Demand Forecast API", version="3.0.0")
 
 
 class ForecastRequest(BaseModel):
@@ -11,7 +11,7 @@ class ForecastRequest(BaseModel):
     demand: List[float]
     stockout: List[int]
     periods: int = 15
-    model: Optional[Literal["auto", "naive", "moving_average"]] = "auto"
+    model: Optional[Literal["auto", "naive", "moving_average", "ets", "croston"]] = "auto"
 
 
 def validate_inputs(demand: List[float], stockout: List[int]) -> None:
@@ -24,32 +24,86 @@ def validate_inputs(demand: List[float], stockout: List[int]) -> None:
 
 
 def clean_demand(demand: List[float], stockout: List[int]) -> List[float]:
-    """
-    Stockout=1 wird als fehlende Beobachtung behandelt und entfernt.
-    """
-    cleaned = [d for d, s in zip(demand, stockout) if s == 0]
-    return cleaned
+    return [d for d, s in zip(demand, stockout) if s == 0]
+
+
+def count_nonzero(values: List[float]) -> int:
+    return sum(1 for x in values if x > 0)
+
+
+def demand_pattern(cleaned: List[float]) -> str:
+    if not cleaned:
+        return "no_demand"
+
+    nz = [x for x in cleaned if x > 0]
+    if not nz:
+        return "all_zero"
+
+    zero_share = sum(1 for x in cleaned if x == 0) / len(cleaned)
+    adi = len(cleaned) / len(nz) if len(nz) > 0 else float("inf")
+
+    if adi > 1.32 or zero_share > 0.4:
+        return "intermittent"
+    return "continuous"
 
 
 def naive_forecast(train: List[float], periods: int) -> List[float]:
-    """
-    Forecast = letzter beobachteter Wert.
-    """
     if not train:
         return []
-    last_value = train[-1]
-    return [float(last_value)] * periods
+    return [float(train[-1])] * periods
 
 
 def moving_average_forecast(train: List[float], periods: int, window: int = 3) -> List[float]:
-    """
-    Forecast = Durchschnitt der letzten n Werte.
-    """
     if not train:
         return []
     effective_window = min(window, len(train))
     avg = sum(train[-effective_window:]) / effective_window
     return [float(avg)] * periods
+
+
+def simple_exponential_smoothing_forecast(train: List[float], periods: int, alpha: float = 0.3) -> List[float]:
+    """
+    Einfache ETS-Variante ohne Trend/Saisonalität (SES).
+    """
+    if not train:
+        return []
+    level = float(train[0])
+    for x in train[1:]:
+        level = alpha * float(x) + (1 - alpha) * level
+    return [level] * periods
+
+
+def croston_forecast(train: List[float], periods: int, alpha: float = 0.1) -> List[float]:
+    """
+    Einfache Croston-Implementierung für intermittierende Nachfrage.
+    """
+    if not train:
+        return []
+
+    demand_sizes = []
+    intervals = []
+
+    interval = 1
+    for x in train:
+        if x > 0:
+            demand_sizes.append(float(x))
+            intervals.append(interval)
+            interval = 1
+        else:
+            interval += 1
+
+    if not demand_sizes:
+        return [0.0] * periods
+
+    z = demand_sizes[0]
+    p = float(intervals[0])
+
+    for i in range(1, len(demand_sizes)):
+        z = alpha * demand_sizes[i] + (1 - alpha) * z
+        p = alpha * intervals[i] + (1 - alpha) * p
+
+    forecast_value = z / p if p != 0 else 0.0
+    return [forecast_value] * periods
 
 
 def mae(actual: List[float], predicted: List[float]) -> float:
@@ -72,30 +126,44 @@ def bias(actual: List[float], predicted: List[float]) -> float:
 
 
 def mase(actual: List[float], predicted: List[float], train: List[float]) -> float:
-    """
-    MASE relativ zu Naive(1)-In-Sample-Fehler.
-    """
     if len(train) < 2 or not actual:
         return 0.0
 
     naive_errors = [abs(train[i] - train[i - 1]) for i in range(1, len(train))]
-    scale = sum(naive_errors) / len(naive_errors)
+    scale = sum(naive_errors) / len(naive_errors) if naive_errors else 0.0
 
     if scale == 0:
         return 0.0
 
-    model_mae = mae(actual, predicted)
-    return model_mae / scale
+    return mae(actual, predicted) / scale
 
 
-def evaluate_model(train: List[float], test: List[float], model_name: str) -> dict:
+def model_is_allowed(model_name: str, train: List[float], pattern: str) -> bool:
+    if model_name == "croston":
+        return pattern == "intermittent" and count_nonzero(train) >= 2
+    if model_name == "ets":
+        return len(train) >= 3
+    if model_name == "moving_average":
+        return len(train) >= 2
     if model_name == "naive":
-        preds = naive_forecast(train, len(test))
-    elif model_name == "moving_average":
-        preds = moving_average_forecast(train, len(test), window=3)
-    else:
-        raise ValueError(f"Unbekanntes Modell: {model_name}")
+        return len(train) >= 1
+    return False
 
+
+def run_model(model_name: str, train: List[float], periods: int) -> List[float]:
+    if model_name == "naive":
+        return naive_forecast(train, periods)
+    if model_name == "moving_average":
+        return moving_average_forecast(train, periods, window=3)
+    if model_name == "ets":
+        return simple_exponential_smoothing_forecast(train, periods, alpha=0.3)
+    if model_name == "croston":
+        return croston_forecast(train, periods, alpha=0.1)
+    raise ValueError(f"Unbekanntes Modell: {model_name}")
+
+
+def evaluate_model(train: List[float], test: List[float], model_name: str) -> Dict[str, Any]:
+    preds = run_model(model_name, train, len(test))
     return {
         "model": model_name,
         "forecast": preds,
@@ -108,27 +176,35 @@ def evaluate_model(train: List[float], test: List[float], model_name: str) -> di
     }
 
 
-def choose_best_model(train: List[float], test: List[float]) -> dict:
-    """
-    Vergleich aktuell zwischen naive und moving_average.
-    Auswahlregel:
-    1. niedrigstes MAE
-    2. niedrigstes WAPE
-    3. Bias möglichst nahe 0
-    """
-    candidates = [
-        evaluate_model(train, test, "naive"),
-        evaluate_model(train, test, "moving_average"),
+def choose_best_model(train: List[float], test: List[float], pattern: str) -> Dict[str, Any]:
+    candidate_models = ["naive", "moving_average", "ets", "croston"]
+    valid_candidates = [
+        m for m in candidate_models if model_is_allowed(m, train, pattern)
     ]
 
-    candidates.sort(
+    if not valid_candidates:
+        raise ValueError("Keine zulässigen Modelle für diese Zeitreihe verfügbar.")
+
+    results = [evaluate_model(train, test, m) for m in valid_candidates]
+
+    # Auswahlregel:
+    # 1. MASE < 1 bevorzugen
+    # 2. min(MAE)
+    # 3. min(WAPE)
+    # 4. Bias möglichst nahe 0
+    results.sort(
         key=lambda x: (
+            0 if x["metrics"]["mase"] < 1 else 1,
             x["metrics"]["mae"],
             x["metrics"]["wape"],
             abs(x["metrics"]["bias"]),
         )
     )
-    return candidates[0]
+
+    return {
+        "best": results[0],
+        "ranking": results
+    }
 
 
 @app.get("/")
@@ -151,12 +227,35 @@ def forecast(req: ForecastRequest):
                     "mae": 0.0,
                     "wape": 0.0,
                     "mase": 0.0,
-                    "bias": 0.0,
+                    "bias": 0.0
                 },
+                "analysis": {
+                    "demand_pattern": "no_demand"
+                },
+                "model_ranking": []
             }
 
+        if count_nonzero(cleaned) == 0:
+            return {
+                "sku": req.sku,
+                "model": "no_forecast",
+                "forecast": [0.0] * req.periods,
+                "metrics": {
+                    "mae": 0.0,
+                    "wape": 0.0,
+                    "mase": 0.0,
+                    "bias": 0.0
+                },
+                "analysis": {
+                    "demand_pattern": "all_zero"
+                },
+                "model_ranking": []
+            }
+
+        pattern = demand_pattern(cleaned)
+
         if len(cleaned) < 2:
-            final_forecast = [float(cleaned[-1])] * req.periods
+            final_forecast = naive_forecast(cleaned, req.periods)
             return {
                 "sku": req.sku,
                 "model": "naive",
@@ -165,43 +264,55 @@ def forecast(req: ForecastRequest):
                     "mae": 0.0,
                     "wape": 0.0,
                     "mase": 0.0,
-                    "bias": 0.0,
+                    "bias": 0.0
                 },
+                "analysis": {
+                    "demand_pattern": pattern
+                },
+                "model_ranking": []
             }
 
-        # Einfacher Holdout für MVP:
-        # letzte 3 Perioden oder mindestens 1 Beobachtung im Test
         test_size = min(3, max(1, len(cleaned) // 4))
         train = cleaned[:-test_size]
         test = cleaned[-test_size:]
 
-        # Falls train leer wird, fallback
         if len(train) == 0:
             train = cleaned[:-1]
             test = cleaned[-1:]
 
         if req.model == "auto":
-            best = choose_best_model(train, test)
-            selected_model = best["model"]
-            backtest_metrics = best["metrics"]
+            selection = choose_best_model(train, test, pattern)
+            selected_model = selection["best"]["model"]
+            backtest_metrics = selection["best"]["metrics"]
+            ranking = selection["ranking"]
         else:
+            if not model_is_allowed(req.model, train, pattern):
+                raise ValueError(f"Modell '{req.model}' ist für diese Zeitreihe nicht zulässig.")
             selected_model = req.model
-            best = evaluate_model(train, test, selected_model)
-            backtest_metrics = best["metrics"]
+            evaluation = evaluate_model(train, test, selected_model)
+            backtest_metrics = evaluation["metrics"]
+            ranking = [evaluation]
 
-        # Final Forecast auf voller bereinigter Historie
-        if selected_model == "naive":
-            final_forecast = naive_forecast(cleaned, req.periods)
-        elif selected_model == "moving_average":
-            final_forecast = moving_average_forecast(cleaned, req.periods, window=3)
-        else:
-            raise ValueError(f"Unbekanntes finales Modell: {selected_model}")
+        final_forecast = run_model(selected_model, cleaned, req.periods)
 
         return {
             "sku": req.sku,
             "model": selected_model,
-            "forecast": final_forecast,
+            "forecast": [round(x, 6) for x in final_forecast],
             "metrics": backtest_metrics,
+            "analysis": {
+                "demand_pattern": pattern
+            },
+            "model_ranking": [
+                {
+                    "model": item["model"],
+                    "mae": item["metrics"]["mae"],
+                    "wape": item["metrics"]["wape"],
+                    "mase": item["metrics"]["mase"],
+                    "bias": item["metrics"]["bias"]
+                }
+                for item in ranking
+            ]
         }
 
     except Exception as e:
@@ -209,5 +320,5 @@ def forecast(req: ForecastRequest):
             "sku": req.sku,
             "status": "failed",
             "reason": "forecast_error",
-            "details": str(e),
+            "details": str(e)
         }
