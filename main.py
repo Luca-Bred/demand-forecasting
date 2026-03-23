@@ -11,7 +11,7 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="Demand Forecast API", version="6.0.0")
+app = FastAPI(title="Demand Forecast API", version="6.1.0")
 
 
 AllowedModel = Literal[
@@ -482,10 +482,10 @@ def evaluate_model_rolling(
     return {
         "model": model_name,
         "metrics": {
-            "mae": round(avg_mae, 6),
-            "wape": round(avg_wape, 6),
-            "mase": round(avg_mase, 6),
-            "bias": round(avg_bias, 6),
+            "mae": round(avg_mae, 2),
+            "wape": round(avg_wape, 4),
+            "mase": round(avg_mase, 4),
+            "bias": round(avg_bias, 2),
         },
         "backtest_config": {
             "splits": len(split_results),
@@ -494,10 +494,10 @@ def evaluate_model_rolling(
         "split_metrics": [
             {
                 "split": x["split"],
-                "mae": round(x["mae"], 6),
-                "wape": round(x["wape"], 6),
-                "mase": round(x["mase"], 6),
-                "bias": round(x["bias"], 6),
+                "mae": round(x["mae"], 2),
+                "wape": round(x["wape"], 4),
+                "mase": round(x["mase"], 4),
+                "bias": round(x["bias"], 2),
             }
             for x in split_results
         ],
@@ -590,7 +590,7 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
             return {
                 "sku": req.sku,
                 "model": "no_forecast",
-                "forecast": [0.0] * req.periods,
+                "forecast": [0] * req.periods,
                 "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
                 "analysis": {
                     "demand_pattern": "all_zero",
@@ -611,12 +611,12 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
             return {
                 "sku": req.sku,
                 "model": selected_model,
-                "forecast": [round(x, 6) for x in final_forecast],
+                "forecast": [int(round(x)) for x in final_forecast],
                 "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
                 "analysis": {
                     "demand_pattern": pattern,
-                    "adi": round(adi, 6) if math.isfinite(adi) else None,
-                    "cv2": round(cv2, 6) if math.isfinite(cv2) else None,
+                    "adi": round(adi, 4) if math.isfinite(adi) else None,
+                    "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
                 },
                 "backtest_config": {"splits": 0, "horizon": 0},
                 "model_ranking": [],
@@ -647,21 +647,26 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
         return {
             "sku": req.sku,
             "model": selected_model,
-            "forecast": [round(x, 6) for x in final_forecast],
-            "metrics": backtest_metrics,
+            "forecast": [int(round(x)) for x in final_forecast],
+            "metrics": {
+                "mae": round(backtest_metrics["mae"], 2),
+                "wape": round(backtest_metrics["wape"], 4),
+                "mase": round(backtest_metrics["mase"], 4),
+                "bias": round(backtest_metrics["bias"], 2),
+            },
             "analysis": {
                 "demand_pattern": pattern,
-                "adi": round(adi, 6) if math.isfinite(adi) else None,
-                "cv2": round(cv2, 6) if math.isfinite(cv2) else None,
+                "adi": round(adi, 4) if math.isfinite(adi) else None,
+                "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
             },
             "backtest_config": backtest_config,
             "model_ranking": [
                 {
                     "model": item["model"],
-                    "mae": item["metrics"]["mae"],
-                    "wape": item["metrics"]["wape"],
-                    "mase": item["metrics"]["mase"],
-                    "bias": item["metrics"]["bias"],
+                    "mae": round(item["metrics"]["mae"], 2),
+                    "wape": round(item["metrics"]["wape"], 4),
+                    "mase": round(item["metrics"]["mase"], 4),
+                    "bias": round(item["metrics"]["bias"], 2),
                 }
                 for item in ranking
             ],
