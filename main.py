@@ -19,16 +19,7 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
 
-# Optional DL
-TORCH_AVAILABLE = False
-try:
-    import torch
-    import torch.nn as nn
-    TORCH_AVAILABLE = True
-except Exception:
-    TORCH_AVAILABLE = False
-
-app = FastAPI(title="Demand Forecast API", version="7.0.0")
+app = FastAPI(title="Demand Forecast API", version="7.1.0")
 
 
 AllowedModel = Literal[
@@ -49,14 +40,13 @@ AllowedModel = Literal[
     "extra_trees",
     "hist_gradient_boosting",
     "mlp",
-    "lstm",
 ]
 
 
 class ForecastRequest(BaseModel):
     sku: str
-    demand: List[float]   # <- KEIN Optional mehr
-    periods: int = 15
+    demand: List[float]
+    periods: int = Field(default=15, ge=1, le=24)
     model: Optional[AllowedModel] = "auto"
     locked_model: Optional[AllowedModel] = None
     evaluation_horizon: int = Field(default=6, ge=1, le=15)
@@ -68,7 +58,7 @@ class ForecastRequest(BaseModel):
 # Validation & preprocessing
 # =========================================================
 
-def validate_inputs(demand: List[Optional[float]], periods: int, evaluation_horizon: int) -> None:
+def validate_inputs(demand: List[float], periods: int, evaluation_horizon: int) -> None:
     if len(demand) == 0:
         raise ValueError("demand darf nicht leer sein.")
     if periods < 1:
@@ -109,7 +99,7 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
     # negative Werte markieren
     flags[arr < 0] = 1
 
-    # Statistik ohne Nullen, damit echte Demand-Niveaus nicht verzerrt werden
+    # Statistik ohne Nullen, damit 0-Werte die Demand-Basis nicht verzerren
     non_zero = arr[arr > 0]
     if len(non_zero) < 3:
         return flags.tolist()
@@ -123,7 +113,7 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
         robust_mask = np.abs(robust_z) > 3.5
         flags[robust_mask] = 1
 
-    # lokale Peaks / Einbrüche
+    # lokale Peaks / Einbrüche + verdächtige Nullen
     for i in range(1, len(arr) - 1):
         prev_v = arr[i - 1]
         curr_v = arr[i]
@@ -136,8 +126,7 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
             if ratio > 4.0 or ratio < 0.2:
                 flags[i] = 1
 
-        # spezielle Behandlung für Nullwerte:
-        # isolierte 0 in ansonsten positivem Umfeld -> Verdacht auf Stockout / Ausreißer
+        # isolierte 0 in sonst positivem Umfeld -> verdächtig
         if curr_v == 0:
             local_avg = (prev_v + next_v) / 2.0
             if local_avg > med * 0.5:
@@ -146,13 +135,12 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
     return flags.tolist()
 
 
-def impute_series(series: List[Optional[float]], outlier_flags: List[int]) -> List[float]:
+def impute_series(series: List[float], outlier_flags: List[int]) -> List[float]:
     """
-    Fehlende Werte und Ausreißer werden imputiert.
-    Nicht pauschal als 0, sondern per linearer Interpolation
-    mit Fallback auf robusten Median.
+    Ausreißer/verdächtige Werte werden als fehlend behandelt und interpoliert.
+    Nicht pauschal auf 0 setzen.
     """
-    arr = np.asarray([np.nan if v is None else float(v) for v in series], dtype=float)
+    arr = np.asarray(series, dtype=float)
 
     for i, flag in enumerate(outlier_flags):
         if flag == 1:
@@ -161,7 +149,6 @@ def impute_series(series: List[Optional[float]], outlier_flags: List[int]) -> Li
     if np.all(np.isnan(arr)):
         return [0.0] * len(arr)
 
-    # lineare Interpolation
     idx = np.arange(len(arr))
     valid_mask = ~np.isnan(arr)
 
@@ -171,17 +158,16 @@ def impute_series(series: List[Optional[float]], outlier_flags: List[int]) -> Li
     else:
         arr[~valid_mask] = np.interp(idx[~valid_mask], idx[valid_mask], arr[valid_mask])
 
-    # negative auf 0
     arr = np.maximum(arr, 0.0)
     return [float(x) for x in arr]
 
 
-def preprocess_demand(series: List[Optional[float]]) -> Dict[str, Any]:
+def preprocess_demand(series: List[float]) -> Dict[str, Any]:
     outlier_flags = detect_outliers_robust(series)
     cleaned = impute_series(series, outlier_flags)
 
     return {
-        "original": [None if v is None else float(v) for v in series],
+        "original": [float(v) for v in series],
         "cleaned": cleaned,
         "outlier_flags": outlier_flags,
         "outlier_count": int(sum(outlier_flags)),
@@ -421,7 +407,7 @@ def tsb_forecast(train: List[float], periods: int, alpha: float = 0.2, beta: flo
 
 
 # =========================================================
-# ML / DL features
+# ML features
 # =========================================================
 
 def create_ml_features(series: List[float], season_length: int = 12) -> Tuple[np.ndarray, np.ndarray]:
@@ -558,87 +544,6 @@ def mlp_forecast(train: List[float], periods: int, season_length: int = 12) -> L
 
 
 # =========================================================
-# Optional Deep Learning (LSTM via PyTorch)
-# =========================================================
-
-if TORCH_AVAILABLE:
-    class LSTMForecaster(nn.Module):
-        def __init__(self, input_size: int = 1, hidden_size: int = 32, num_layers: int = 1):
-            super().__init__()
-            self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
-            self.fc = nn.Linear(hidden_size, 1)
-
-        def forward(self, x):
-            out, _ = self.lstm(x)
-            out = out[:, -1, :]
-            out = self.fc(out)
-            return out
-
-
-def create_lstm_sequences(series: List[float], lookback: int = 12):
-    values = np.asarray(series, dtype=np.float32)
-    X, y = [], []
-
-    for i in range(lookback, len(values)):
-        X.append(values[i - lookback:i])
-        y.append(values[i])
-
-    X_arr = np.asarray(X, dtype=np.float32)
-    y_arr = np.asarray(y, dtype=np.float32)
-
-    return X_arr, y_arr
-
-
-def lstm_forecast(train: List[float], periods: int, lookback: int = 12) -> List[float]:
-    if not TORCH_AVAILABLE:
-        raise ValueError("PyTorch ist nicht installiert. LSTM nicht verfügbar.")
-
-    if len(train) < 30:
-        raise ValueError("Zu wenig Historie für LSTM.")
-
-    series = np.asarray(train, dtype=np.float32)
-    mean_ = float(series.mean())
-    std_ = float(series.std()) if float(series.std()) > 0 else 1.0
-    norm = (series - mean_) / std_
-
-    X, y = create_lstm_sequences(norm.tolist(), lookback=lookback)
-    if len(X) < 10:
-        raise ValueError("Zu wenig Trainingssequenzen für LSTM.")
-
-    X_t = torch.tensor(X).unsqueeze(-1)
-    y_t = torch.tensor(y).unsqueeze(-1)
-
-    model = LSTMForecaster(input_size=1, hidden_size=32, num_layers=1)
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-
-    model.train()
-    for _ in range(120):
-        optimizer.zero_grad()
-        pred = model(X_t)
-        loss = criterion(pred, y_t)
-        loss.backward()
-        optimizer.step()
-
-    model.eval()
-    history = norm.tolist()
-    forecasts = []
-
-    with torch.no_grad():
-        for _ in range(periods):
-            x_in = np.asarray(history[-lookback:], dtype=np.float32).reshape(1, lookback, 1)
-            x_t = torch.tensor(x_in)
-            pred_norm = float(model(x_t).numpy().flatten()[0])
-            pred = pred_norm * std_ + mean_
-            pred = max(0.0, pred)
-
-            forecasts.append(pred)
-            history.append(pred_norm)
-
-    return forecasts
-
-
-# =========================================================
 # Model dispatcher
 # =========================================================
 
@@ -675,8 +580,6 @@ def run_model(model_name: str, train: List[float], periods: int, season_length: 
         return hist_gradient_boosting_forecast(train, periods, season_length=season_length)
     if model_name == "mlp":
         return mlp_forecast(train, periods, season_length=season_length)
-    if model_name == "lstm":
-        return lstm_forecast(train, periods, lookback=season_length)
 
     raise ValueError(f"Unbekanntes Modell: {model_name}")
 
@@ -721,8 +624,6 @@ def model_is_allowed(model_name: str, train: List[float], pattern: str, season_l
         return n >= 24
     if model_name == "mlp":
         return n >= 24
-    if model_name == "lstm":
-        return TORCH_AVAILABLE and n >= 30
 
     return False
 
@@ -770,7 +671,7 @@ def evaluate_model_rolling(
         series=series,
         n_splits=n_splits,
         horizon=horizon,
-        min_train_size=max(6, season_length),
+        min_train_size=max(6, min(season_length, len(series) - horizon - 1)) if len(series) > horizon + 1 else 6,
     )
 
     if not splits:
@@ -849,7 +750,6 @@ def choose_best_model(
         "extra_trees",
         "hist_gradient_boosting",
         "mlp",
-        "lstm",
     ]
 
     ref_series = series[:-horizon] if len(series) > horizon else series[:-1] if len(series) > 1 else series
@@ -943,12 +843,16 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
                 "backtest_config": {"splits": 0, "horizon": 0},
                 "model_ranking": [],
                 "excluded_models": [],
+                "preprocessing": {
+                    "original": prep["original"],
+                    "cleaned": [round(x, 2) for x in cleaned],
+                },
             }
 
         pattern = detect_demand_pattern(cleaned)
         adi, cv2 = compute_adi_cv2(cleaned)
 
-        # sehr kurze Historie -> einfache Verfahren
+        # Sehr kurze Historie
         if len(cleaned) < 4:
             selected_model = "naive"
             final_forecast = naive_forecast(cleaned, req.periods)
@@ -975,13 +879,9 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
                 },
             }
 
-        # kurze Historie -> einfache Glättung bevorzugen
+        # Kurze Historie -> einfache Verfahren
         if len(cleaned) < 8 and req.model == "auto" and req.locked_model is None:
             selected_model = "ets" if model_is_allowed("ets", cleaned, pattern, req.season_length) else "naive"
-            evaluation = {
-                "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
-                "backtest_config": {"splits": 0, "horizon": 0},
-            }
             final_forecast = run_model(selected_model, cleaned, req.periods, season_length=req.season_length)
 
             return {
@@ -989,7 +889,7 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
                 "model": selected_model,
                 "model_changed": False,
                 "forecast": round_forecast(final_forecast),
-                "metrics": evaluation["metrics"],
+                "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
                 "analysis": {
                     "demand_pattern": pattern,
                     "adi": round(adi, 4) if math.isfinite(adi) else None,
@@ -997,7 +897,7 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
                     "outlier_count": prep["outlier_count"],
                     "outlier_flags": prep["outlier_flags"],
                 },
-                "backtest_config": evaluation["backtest_config"],
+                "backtest_config": {"splits": 0, "horizon": 0},
                 "model_ranking": [],
                 "excluded_models": [],
                 "preprocessing": {
@@ -1008,7 +908,6 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
 
         model_changed = False
 
-        # Modell-Freeze: wenn locked_model gesetzt ist, wird dieses beibehalten
         if req.locked_model and req.locked_model != "auto":
             if not model_is_allowed(req.locked_model, cleaned, pattern, req.season_length):
                 raise ValueError(f"locked_model '{req.locked_model}' ist für diese Zeitreihe nicht zulässig.")
