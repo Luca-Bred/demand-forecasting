@@ -55,7 +55,7 @@ AllowedModel = Literal[
 
 class ForecastRequest(BaseModel):
     sku: str
-    demand: List[Optional[float]]
+    demand: List[float]   # <- KEIN Optional mehr
     periods: int = 15
     model: Optional[AllowedModel] = "auto"
     locked_model: Optional[AllowedModel] = None
@@ -95,46 +95,52 @@ def robust_mad(x: np.ndarray) -> float:
     return float(mad)
 
 
-def detect_outliers_robust(series: List[Optional[float]]) -> List[int]:
+def detect_outliers_robust(series: List[float]) -> List[int]:
     """
     Robuste Outlier-Erkennung:
-    - fehlende Werte -> Flag
     - negative Werte -> Flag
     - robuste Z-Scores via Median/MAD
-    - zusätzlich lokale harte Sprünge
+    - lokale harte Sprünge
+    - verdächtige Nullen als möglicher Stockout / verdeckter Bedarf
     """
-    arr = np.asarray([np.nan if v is None else float(v) for v in series], dtype=float)
+    arr = np.asarray(series, dtype=float)
     flags = np.zeros(len(arr), dtype=int)
 
-    # Fehlend / negativ direkt markieren
-    for i, v in enumerate(arr):
-        if np.isnan(v) or v < 0:
-            flags[i] = 1
+    # negative Werte markieren
+    flags[arr < 0] = 1
 
-    valid = arr[~np.isnan(arr)]
-    if len(valid) < 3:
+    # Statistik ohne Nullen, damit echte Demand-Niveaus nicht verzerrt werden
+    non_zero = arr[arr > 0]
+    if len(non_zero) < 3:
         return flags.tolist()
 
-    med = float(np.median(valid))
-    mad = robust_mad(valid)
+    med = float(np.median(non_zero))
+    mad = robust_mad(non_zero)
 
+    # globale robuste Ausreißererkennung
     if mad > 0:
         robust_z = 0.6745 * (arr - med) / mad
-        robust_outlier_mask = np.abs(robust_z) > 3.5
-        flags[robust_outlier_mask & ~np.isnan(arr)] = 1
+        robust_mask = np.abs(robust_z) > 3.5
+        flags[robust_mask] = 1
 
-    # Lokale abrupte Sprünge
+    # lokale Peaks / Einbrüche
     for i in range(1, len(arr) - 1):
-        if np.isnan(arr[i - 1]) or np.isnan(arr[i]) or np.isnan(arr[i + 1]):
-            continue
+        prev_v = arr[i - 1]
+        curr_v = arr[i]
+        next_v = arr[i + 1]
 
-        local_med = float(np.median([arr[i - 1], arr[i + 1]]))
-        if local_med == 0:
-            if arr[i] > 0 and arr[i] > med * 3:
-                flags[i] = 1
-        else:
-            ratio = arr[i] / local_med if local_med != 0 else np.inf
+        local_med = float(np.median([prev_v, next_v]))
+
+        if local_med > 0:
+            ratio = curr_v / local_med
             if ratio > 4.0 or ratio < 0.2:
+                flags[i] = 1
+
+        # spezielle Behandlung für Nullwerte:
+        # isolierte 0 in ansonsten positivem Umfeld -> Verdacht auf Stockout / Ausreißer
+        if curr_v == 0:
+            local_avg = (prev_v + next_v) / 2.0
+            if local_avg > med * 0.5:
                 flags[i] = 1
 
     return flags.tolist()
