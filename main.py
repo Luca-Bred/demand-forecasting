@@ -330,9 +330,17 @@ def robust_mad(x: np.ndarray) -> float:
 
 
 def detect_outliers_robust(series: List[float]) -> List[int]:
+    """
+    Erkennt mögliche Ausreißer:
+    - negative Werte
+    - globale Ausreißer über Median/MAD
+    - lokale abrupte Sprünge
+    - verdächtige isolierte Nullen, aber NICHT pauschal bei intermittent/lumpy demand
+    """
     arr = np.asarray(series, dtype=float)
     flags = np.zeros(len(arr), dtype=int)
 
+    # negative Werte sind unplausibel
     flags[arr < 0] = 1
 
     non_zero = arr[arr > 0]
@@ -341,6 +349,9 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
 
     med = float(np.median(non_zero))
     mad = robust_mad(non_zero)
+
+    # Demand Pattern für Zero-Handling bestimmen
+    pattern = detect_demand_pattern([float(x) for x in arr.tolist()])
 
     if mad > 0:
         robust_z = 0.6745 * (arr - med) / mad
@@ -354,17 +365,20 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
 
         local_med = float(np.median([prev_v, next_v]))
         if local_med > 0:
-            ratio = curr_v / local_med
-            if ratio > 4.0 or ratio < 0.2:
+            ratio = curr_v / local_med if local_med != 0 else 1.0
+            if ratio > 4.0 or (curr_v > 0 and ratio < 0.2):
                 flags[i] = 1
 
-        if curr_v == 0:
+        # Zero-Handling NUR für smooth/erratic
+        # Bei intermittent/lumpy sind echte Null-Nachfragen normal
+        if curr_v == 0 and pattern in ("smooth", "erratic"):
             local_avg = (prev_v + next_v) / 2.0
-            if local_avg > med * 0.5:
+
+            # nur isolierte Null mit positiven Nachbarn prüfen
+            if prev_v > 0 and next_v > 0 and local_avg > med * 0.5:
                 flags[i] = 1
 
     return flags.tolist()
-
 
 def impute_series(series: List[float], outlier_flags: List[int]) -> List[float]:
     arr = np.asarray(series, dtype=float)
