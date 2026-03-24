@@ -1,11 +1,12 @@
 from typing import Any, Dict, List, Literal, Optional, Tuple
 import io
 import math
+import os
 import warnings
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sklearn.ensemble import (
@@ -22,7 +23,25 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="Demand Forecast API", version="10.0.0")
+app = FastAPI(title="Demand Forecast API", version="10.1.0")
+
+
+# =========================================================
+# AUTH
+# =========================================================
+API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "").strip()
+
+
+def verify_bearer_token(authorization: Optional[str]) -> None:
+    if not API_BEARER_TOKEN:
+        raise HTTPException(status_code=500, detail="Server auth not configured.")
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    token = authorization.removeprefix("Bearer ").strip()
+    if token != API_BEARER_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
 
 
 # =========================================================
@@ -178,13 +197,6 @@ def robust_mad(x: np.ndarray) -> float:
 
 
 def detect_outliers_robust(series: List[float]) -> List[int]:
-    """
-    Erkennt mögliche Ausreißer:
-    - negative Werte
-    - globale Ausreißer über Median/MAD
-    - lokale abrupte Sprünge
-    - verdächtige isolierte Nullen
-    """
     arr = np.asarray(series, dtype=float)
     flags = np.zeros(len(arr), dtype=int)
 
@@ -222,9 +234,6 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
 
 
 def impute_series(series: List[float], outlier_flags: List[int]) -> List[float]:
-    """
-    Markierte Werte werden als fehlend behandelt und interpoliert.
-    """
     arr = np.asarray(series, dtype=float)
 
     for i, flag in enumerate(outlier_flags):
@@ -250,7 +259,6 @@ def impute_series(series: List[float], outlier_flags: List[int]) -> List[float]:
 def preprocess_demand(series: List[float]) -> Dict[str, Any]:
     outlier_flags = detect_outliers_robust(series)
     cleaned = impute_series(series, outlier_flags)
-
     return {
         "original": [float(v) for v in series],
         "cleaned": cleaned,
@@ -518,7 +526,7 @@ def create_ml_features(series: List[float], season_length: int = 12) -> Tuple[np
     return np.asarray(rows), np.asarray(targets)
 
 
-def recursive_ml_forecast(model, train: List[float], periods: int, season_length: int = 12) -> List[float]:
+def recursive_ml_forecast(model: Any, train: List[float], periods: int, season_length: int = 12) -> List[float]:
     history = list(map(float, train))
     forecasts: List[float] = []
 
@@ -1009,7 +1017,6 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             seasonal_factors=SEASONAL_FACTORS,
             trend_factor=req.trend_factor,
         )
-
         return build_success_response(
             sku=req.sku,
             model=selected_model,
@@ -1031,7 +1038,6 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             seasonal_factors=SEASONAL_FACTORS,
             trend_factor=req.trend_factor,
         )
-
         return build_success_response(
             sku=req.sku,
             model=selected_model,
@@ -1139,19 +1145,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def detect_required_columns(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
-    """
-    Pflichtspalten:
-    - SKU
-    - Verbrauch
-
-    Optionale Zeitspalte:
-    - Datum / Periode
-
-    Zulässige Aliasnamen:
-    SKU: SKU, sku, Artikel, artikel
-    Verbrauch: Verbrauch, verbrauch, Demand, demand, Menge, menge
-    Datum: Datum, datum, Date, date, Periode, periode, Period, period, Monat, monat
-    """
     col_map = {c.lower(): c for c in df.columns}
 
     sku_candidates = ["sku", "artikel"]
@@ -1197,7 +1190,6 @@ def detect_file_format(filename: str) -> str:
 
 def read_input_file(file: UploadFile) -> pd.DataFrame:
     input_format = detect_file_format(file.filename or "")
-
     try:
         file.file.seek(0)
         if input_format == "csv":
@@ -1288,9 +1280,14 @@ def health() -> Dict[str, str]:
 @app.post(
     "/forecast",
     response_model=ForecastResponse,
-    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    responses={400: {"model": ErrorResponse}, 401: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
 )
-def forecast(req: ForecastRequest) -> Dict[str, Any]:
+def forecast(
+    req: ForecastRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    verify_bearer_token(authorization)
+
     try:
         return compute_forecast_from_request(req)
     except ValueError as exc:
@@ -1316,6 +1313,7 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
 @app.post("/forecast-file")
 async def forecast_file(
     file: UploadFile = File(...),
+    authorization: Optional[str] = Header(default=None),
     trend_factor: float = Form(1.0),
     periods: int = Form(15),
     model: str = Form("auto"),
@@ -1326,6 +1324,8 @@ async def forecast_file(
     forecast_start_month: int = Form(1),
     output_format: str = Form("same"),
 ):
+    verify_bearer_token(authorization)
+
     try:
         if not file.filename:
             raise HTTPException(status_code=400, detail="Es wurde keine Datei übergeben.")
