@@ -1,8 +1,10 @@
 from typing import Any, Dict, List, Literal, Optional, Tuple
 import io
+import json
 import math
 import os
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -23,8 +25,7 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="Demand Forecast API", version="10.1.0")
-
+app = FastAPI(title="Demand Forecast API", version="11.0.0")
 
 # =========================================================
 # AUTH
@@ -45,7 +46,82 @@ def verify_bearer_token(authorization: Optional[str]) -> None:
 
 
 # =========================================================
-# Feste saisonale Faktoren
+# REGISTRY / MODELLBINDUNG
+# =========================================================
+MODEL_REGISTRY_PATH = Path(os.getenv("MODEL_REGISTRY_PATH", "sku_model_registry.json"))
+MODEL_SWITCH_WAPE_IMPROVEMENT = float(os.getenv("MODEL_SWITCH_WAPE_IMPROVEMENT", "0.10"))
+
+
+def load_model_registry() -> Dict[str, Any]:
+    if not MODEL_REGISTRY_PATH.exists():
+        return {}
+    try:
+        with MODEL_REGISTRY_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_model_registry(registry: Dict[str, Any]) -> None:
+    MODEL_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with MODEL_REGISTRY_PATH.open("w", encoding="utf-8") as f:
+        json.dump(registry, f, ensure_ascii=False, indent=2)
+
+
+def get_established_model(sku: str) -> Optional[Dict[str, Any]]:
+    registry = load_model_registry()
+    item = registry.get(sku)
+    return item if isinstance(item, dict) else None
+
+
+def set_established_model(
+    sku: str,
+    model: str,
+    metrics: Optional[Dict[str, float]] = None,
+    source: str = "manual_confirmation",
+) -> None:
+    registry = load_model_registry()
+    registry[sku] = {
+        "model": model,
+        "metrics": metrics or {},
+        "source": source,
+    }
+    save_model_registry(registry)
+
+
+def should_suggest_model_switch(
+    established_model: str,
+    established_metrics: Optional[Dict[str, Any]],
+    best_model: str,
+    best_metrics: Dict[str, Any],
+) -> bool:
+    if established_model == best_model:
+        return False
+
+    if not established_metrics:
+        return True
+
+    established_wape = established_metrics.get("wape")
+    best_wape = best_metrics.get("wape")
+    established_mase = established_metrics.get("mase")
+    best_mase = best_metrics.get("mase")
+
+    if isinstance(established_wape, (int, float)) and isinstance(best_wape, (int, float)):
+        if established_wape > 0:
+            relative_improvement = (established_wape - best_wape) / established_wape
+            if relative_improvement >= MODEL_SWITCH_WAPE_IMPROVEMENT:
+                return True
+
+    if isinstance(established_mase, (int, float)) and isinstance(best_mase, (int, float)):
+        if established_mase >= 1 and best_mase < 1:
+            return True
+
+    return False
+
+
+# =========================================================
+# KONFIGURATION
 # =========================================================
 SEASONAL_FACTORS: Dict[int, float] = {
     1: 1.00,
@@ -84,13 +160,13 @@ AllowedModel = Literal[
 
 
 # =========================================================
-# Response Models
+# RESPONSE MODELS
 # =========================================================
 class MetricsModel(BaseModel):
-    mae: float
-    wape: float
-    mase: float
-    bias: float
+    mae: Optional[float]
+    wape: Optional[float]
+    mase: Optional[float]
+    bias: Optional[float]
 
 
 class AnalysisModel(BaseModel):
@@ -105,15 +181,33 @@ class AnalysisModel(BaseModel):
 
 class ModelRankingItem(BaseModel):
     model: str
-    mae: float
-    wape: float
-    mase: float
-    bias: float
+    mae: Optional[float]
+    wape: Optional[float]
+    mase: Optional[float]
+    bias: Optional[float]
+
+
+class Top3ForecastItem(BaseModel):
+    rank: int
+    model: str
+    metrics: MetricsModel
+    forecast: List[int]
 
 
 class PreprocessingModel(BaseModel):
     original: List[float]
     cleaned: List[float]
+
+
+class EstablishedModelInfo(BaseModel):
+    sku_has_established_model: bool
+    established_model: Optional[str]
+    selected_model: str
+    model_switch_suggested: bool
+    suggested_model: Optional[str]
+    switch_reason: Optional[str]
+    manual_confirmation_required: bool
+    model_change_applied: bool
 
 
 class ForecastResponse(BaseModel):
@@ -125,8 +219,10 @@ class ForecastResponse(BaseModel):
     analysis: AnalysisModel
     backtest_config: Dict[str, Any]
     model_ranking: List[ModelRankingItem]
+    top_3_forecasts: List[Top3ForecastItem]
     excluded_models: List[Dict[str, str]]
     preprocessing: PreprocessingModel
+    established_model_info: EstablishedModelInfo
 
 
 class ErrorResponse(BaseModel):
@@ -146,10 +242,14 @@ class ForecastRequest(BaseModel):
     season_length: int = Field(default=12, ge=2, le=24)
     trend_factor: float = Field(default=1.0, ge=0.01, le=10.0)
     forecast_start_month: int = Field(default=1, ge=1, le=12)
+    prefer_established_model: bool = Field(default=True)
+    allow_model_change: bool = Field(default=False)
+    confirm_model_change_to: Optional[str] = None
+    save_selected_model_as_established: bool = Field(default=False)
 
 
 # =========================================================
-# Validation & preprocessing
+# VALIDATION & PREPROCESSING
 # =========================================================
 def validate_inputs(
     demand: List[float],
@@ -174,8 +274,6 @@ def validate_inputs(
         raise ValueError("n_splits muss >= 1 sein.")
     if season_length < 2:
         raise ValueError("season_length muss >= 2 sein.")
-    if evaluation_horizon >= len(demand):
-        raise ValueError("evaluation_horizon muss kleiner als die Länge von demand sein.")
 
 
 def clip_non_negative(values: List[float]) -> List[float]:
@@ -259,6 +357,7 @@ def impute_series(series: List[float], outlier_flags: List[int]) -> List[float]:
 def preprocess_demand(series: List[float]) -> Dict[str, Any]:
     outlier_flags = detect_outliers_robust(series)
     cleaned = impute_series(series, outlier_flags)
+
     return {
         "original": [float(v) for v in series],
         "cleaned": cleaned,
@@ -300,7 +399,7 @@ def detect_demand_pattern(series: List[float]) -> str:
 
 
 # =========================================================
-# Metrics
+# METRICS
 # =========================================================
 def mae(actual: List[float], predicted: List[float]) -> float:
     if not actual:
@@ -337,7 +436,7 @@ def mase(actual: List[float], predicted: List[float], train: List[float], m: int
 
 
 # =========================================================
-# Forecast models
+# FORECAST MODELS
 # =========================================================
 def naive_forecast(train: List[float], periods: int) -> List[float]:
     last_value = float(train[-1])
@@ -498,7 +597,7 @@ def tsb_forecast(train: List[float], periods: int, alpha: float = 0.2, beta: flo
 
 
 # =========================================================
-# ML features
+# ML FEATURES
 # =========================================================
 def create_ml_features(series: List[float], season_length: int = 12) -> Tuple[np.ndarray, np.ndarray]:
     values = list(map(float, series))
@@ -635,7 +734,7 @@ def mlp_forecast(train: List[float], periods: int, season_length: int = 12) -> L
 
 
 # =========================================================
-# Business adjustments
+# BUSINESS ADJUSTMENTS
 # =========================================================
 def apply_business_adjustments(
     forecast: List[float],
@@ -657,7 +756,7 @@ def apply_business_adjustments(
 
 
 # =========================================================
-# Model dispatcher
+# MODEL DISPATCHER
 # =========================================================
 def run_model(model_name: str, train: List[float], periods: int, season_length: int = 12) -> List[float]:
     if model_name == "naive":
@@ -697,7 +796,7 @@ def run_model(model_name: str, train: List[float], periods: int, season_length: 
 
 
 # =========================================================
-# Model eligibility
+# MODEL ELIGIBILITY
 # =========================================================
 def model_is_allowed(model_name: str, train: List[float], pattern: str, season_length: int = 12) -> bool:
     n = len(train)
@@ -740,7 +839,7 @@ def model_is_allowed(model_name: str, train: List[float], pattern: str, season_l
 
 
 # =========================================================
-# Rolling backtesting
+# ROLLING BACKTESTING
 # =========================================================
 def generate_rolling_splits(
     series: List[float],
@@ -823,6 +922,7 @@ def evaluate_model_rolling(
         "backtest_config": {
             "splits": len(split_results),
             "horizon": horizon,
+            "backtest_available": True,
         },
         "split_metrics": [
             {
@@ -835,6 +935,30 @@ def evaluate_model_rolling(
             for x in split_results
         ],
     }
+
+
+def safe_effective_backtest_params(
+    series: List[float],
+    requested_horizon: int,
+    requested_splits: int,
+    season_length: int,
+) -> Tuple[int, int, bool]:
+    n = len(series)
+    if n < 4:
+        return 1, 1, False
+
+    effective_horizon = min(requested_horizon, max(1, n - 2))
+    min_train_size = max(6, min(season_length, max(2, n - effective_horizon - 1)))
+    splits = generate_rolling_splits(
+        series=series,
+        n_splits=requested_splits,
+        horizon=effective_horizon,
+        min_train_size=min_train_size,
+    )
+    if not splits:
+        return effective_horizon, 1, False
+
+    return effective_horizon, min(len(splits), requested_splits), True
 
 
 def choose_best_model(
@@ -891,10 +1015,10 @@ def choose_best_model(
 
     results.sort(
         key=lambda x: (
-            0 if x["metrics"]["mase"] < 1 else 1,
-            x["metrics"]["wape"],
-            x["metrics"]["mae"],
-            abs(x["metrics"]["bias"]),
+            0 if (x["metrics"]["mase"] is not None and x["metrics"]["mase"] < 1) else 1,
+            x["metrics"]["wape"] if x["metrics"]["wape"] is not None else float("inf"),
+            x["metrics"]["mae"] if x["metrics"]["mae"] is not None else float("inf"),
+            abs(x["metrics"]["bias"]) if x["metrics"]["bias"] is not None else float("inf"),
         )
     )
 
@@ -906,18 +1030,24 @@ def choose_best_model(
 
 
 # =========================================================
-# Forecast core
+# FORECAST CORE
 # =========================================================
+def metrics_none() -> Dict[str, Optional[float]]:
+    return {"mae": None, "wape": None, "mase": None, "bias": None}
+
+
 def build_success_response(
     sku: str,
     model: str,
     forecast: List[int],
-    metrics: Dict[str, float],
+    metrics: Dict[str, Optional[float]],
     analysis: Dict[str, Any],
     backtest_config: Dict[str, Any],
     model_ranking: List[Dict[str, Any]],
+    top_3_forecasts: List[Dict[str, Any]],
     excluded_models: List[Dict[str, str]],
     preprocessing: Dict[str, Any],
+    established_model_info: Dict[str, Any],
 ) -> Dict[str, Any]:
     return {
         "status": "success",
@@ -928,9 +1058,111 @@ def build_success_response(
         "analysis": analysis,
         "backtest_config": backtest_config,
         "model_ranking": model_ranking,
+        "top_3_forecasts": top_3_forecasts,
         "excluded_models": excluded_models,
         "preprocessing": preprocessing,
+        "established_model_info": established_model_info,
     }
+
+
+def fallback_model_for_short_history(cleaned: List[float], pattern: str, season_length: int) -> str:
+    if len(cleaned) < 4:
+        return "naive"
+    if model_is_allowed("ets", cleaned, pattern, season_length):
+        return "ets"
+    if model_is_allowed("moving_average", cleaned, pattern, season_length):
+        return "moving_average"
+    return "naive"
+
+
+def build_short_history_ranking(
+    cleaned: List[float],
+    pattern: str,
+    periods: int,
+    season_length: int,
+    trend_factor: float,
+    forecast_start_month: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    candidate_models = [
+        "naive",
+        "moving_average",
+        "ets",
+        "holt",
+        "seasonal_naive",
+        "arima",
+        "croston",
+        "sba",
+        "tsb",
+    ]
+    ranking: List[Dict[str, Any]] = []
+    excluded_models: List[Dict[str, Any]] = []
+
+    for model_name in candidate_models:
+        try:
+            if not model_is_allowed(model_name, cleaned, pattern, season_length):
+                raise ValueError("Modell für diese Historie nicht zulässig.")
+
+            fc = run_model(model_name, cleaned, periods, season_length=season_length)
+            fc = apply_business_adjustments(
+                forecast=fc,
+                start_month=forecast_start_month,
+                seasonal_factors=SEASONAL_FACTORS,
+                trend_factor=trend_factor,
+            )
+
+            ranking.append(
+                {
+                    "model": model_name,
+                    "metrics": metrics_none(),
+                    "forecast": round_forecast(fc),
+                }
+            )
+        except Exception as exc:
+            excluded_models.append({"model": model_name, "reason": str(exc)})
+
+    return ranking, excluded_models
+
+
+def build_top_3_forecasts_from_ranking(
+    ranking: List[Dict[str, Any]],
+    cleaned: List[float],
+    periods: int,
+    season_length: int,
+    trend_factor: float,
+    forecast_start_month: int,
+) -> List[Dict[str, Any]]:
+    top_3: List[Dict[str, Any]] = []
+
+    for rank, item in enumerate(ranking[:3], start=1):
+        model_name = item["model"]
+
+        if "forecast" in item:
+            forecast_values = item["forecast"]
+        else:
+            fc = run_model(model_name, cleaned, periods, season_length=season_length)
+            fc = apply_business_adjustments(
+                forecast=fc,
+                start_month=forecast_start_month,
+                seasonal_factors=SEASONAL_FACTORS,
+                trend_factor=trend_factor,
+            )
+            forecast_values = round_forecast(fc)
+
+        top_3.append(
+            {
+                "rank": rank,
+                "model": model_name,
+                "metrics": {
+                    "mae": item["metrics"].get("mae"),
+                    "wape": item["metrics"].get("wape"),
+                    "mase": item["metrics"].get("mase"),
+                    "bias": item["metrics"].get("bias"),
+                },
+                "forecast": forecast_values,
+            }
+        )
+
+    return top_3
 
 
 def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
@@ -950,7 +1182,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             sku=req.sku,
             model="no_forecast",
             forecast=[],
-            metrics={"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
+            metrics=metrics_none(),
             analysis={
                 "demand_pattern": "no_demand",
                 "adi": None,
@@ -960,10 +1192,21 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
                 "trend_factor": req.trend_factor,
                 "forecast_start_month": req.forecast_start_month,
             },
-            backtest_config={"splits": 0, "horizon": 0},
+            backtest_config={"splits": 0, "horizon": 0, "backtest_available": False},
             model_ranking=[],
+            top_3_forecasts=[],
             excluded_models=[],
             preprocessing={"original": prep["original"], "cleaned": []},
+            established_model_info={
+                "sku_has_established_model": False,
+                "established_model": None,
+                "selected_model": "no_forecast",
+                "model_switch_suggested": False,
+                "suggested_model": None,
+                "switch_reason": None,
+                "manual_confirmation_required": False,
+                "model_change_applied": False,
+            },
         )
 
     if count_nonzero(cleaned) == 0:
@@ -971,7 +1214,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             sku=req.sku,
             model="no_forecast",
             forecast=[0] * req.periods,
-            metrics={"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
+            metrics=metrics_none(),
             analysis={
                 "demand_pattern": "all_zero",
                 "adi": None,
@@ -981,12 +1224,23 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
                 "trend_factor": req.trend_factor,
                 "forecast_start_month": req.forecast_start_month,
             },
-            backtest_config={"splits": 0, "horizon": 0},
+            backtest_config={"splits": 0, "horizon": 0, "backtest_available": False},
             model_ranking=[],
+            top_3_forecasts=[],
             excluded_models=[],
             preprocessing={
                 "original": prep["original"],
                 "cleaned": [round(x, 2) for x in cleaned],
+            },
+            established_model_info={
+                "sku_has_established_model": False,
+                "established_model": None,
+                "selected_model": "no_forecast",
+                "model_switch_suggested": False,
+                "suggested_model": None,
+                "switch_reason": None,
+                "manual_confirmation_required": False,
+                "model_change_applied": False,
             },
         )
 
@@ -1008,97 +1262,180 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
         "cleaned": [round(x, 2) for x in cleaned],
     }
 
-    if len(cleaned) < 4:
-        selected_model = "naive"
-        final_forecast = naive_forecast(cleaned, req.periods)
-        final_forecast = apply_business_adjustments(
-            forecast=final_forecast,
-            start_month=req.forecast_start_month,
-            seasonal_factors=SEASONAL_FACTORS,
-            trend_factor=req.trend_factor,
-        )
-        return build_success_response(
-            sku=req.sku,
-            model=selected_model,
-            forecast=round_forecast(final_forecast),
-            metrics={"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
-            analysis=analysis,
-            backtest_config={"splits": 0, "horizon": 0},
-            model_ranking=[],
-            excluded_models=[],
-            preprocessing=preprocessing,
-        )
+    established = get_established_model(req.sku)
+    established_model = established.get("model") if established else None
+    established_metrics = established.get("metrics") if established else None
 
-    if len(cleaned) < 8 and req.model == "auto" and req.locked_model is None:
-        selected_model = "ets" if model_is_allowed("ets", cleaned, pattern, req.season_length) else "naive"
-        final_forecast = run_model(selected_model, cleaned, req.periods, season_length=req.season_length)
-        final_forecast = apply_business_adjustments(
-            forecast=final_forecast,
-            start_month=req.forecast_start_month,
-            seasonal_factors=SEASONAL_FACTORS,
-            trend_factor=req.trend_factor,
-        )
-        return build_success_response(
-            sku=req.sku,
-            model=selected_model,
-            forecast=round_forecast(final_forecast),
-            metrics={"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
-            analysis=analysis,
-            backtest_config={"splits": 0, "horizon": 0},
-            model_ranking=[],
-            excluded_models=[],
-            preprocessing=preprocessing,
-        )
+    effective_horizon, effective_splits, backtest_possible = safe_effective_backtest_params(
+        series=cleaned,
+        requested_horizon=req.evaluation_horizon,
+        requested_splits=req.n_splits,
+        season_length=req.season_length,
+    )
+
+    ranking: List[Dict[str, Any]] = []
+    excluded_models: List[Dict[str, str]] = []
+    backtest_config: Dict[str, Any]
+    best_model: str
 
     if req.locked_model and req.locked_model != "auto":
         if not model_is_allowed(req.locked_model, cleaned, pattern, req.season_length):
             raise ValueError(f"locked_model '{req.locked_model}' ist für diese Zeitreihe nicht zulässig.")
 
-        evaluation = evaluate_model_rolling(
-            series=cleaned,
-            model_name=req.locked_model,
-            pattern=pattern,
-            n_splits=req.n_splits,
-            horizon=req.evaluation_horizon,
-            season_length=req.season_length,
-        )
-        selected_model = req.locked_model
-        backtest_metrics = evaluation["metrics"]
-        backtest_config = evaluation["backtest_config"]
-        ranking = [evaluation]
-        excluded_models: List[Dict[str, str]] = []
+        best_model = req.locked_model
+
+        if backtest_possible:
+            evaluation = evaluate_model_rolling(
+                series=cleaned,
+                model_name=req.locked_model,
+                pattern=pattern,
+                n_splits=effective_splits,
+                horizon=effective_horizon,
+                season_length=req.season_length,
+            )
+            ranking = [evaluation]
+            backtest_config = evaluation["backtest_config"]
+        else:
+            fc = run_model(best_model, cleaned, req.periods, season_length=req.season_length)
+            fc = apply_business_adjustments(
+                forecast=fc,
+                start_month=req.forecast_start_month,
+                seasonal_factors=SEASONAL_FACTORS,
+                trend_factor=req.trend_factor,
+            )
+            ranking = [{
+                "model": best_model,
+                "metrics": metrics_none(),
+                "forecast": round_forecast(fc),
+            }]
+            backtest_config = {
+                "splits": 0,
+                "horizon": effective_horizon,
+                "backtest_available": False,
+                "reason": "Zu wenig Historie für belastbares Backtesting.",
+            }
 
     elif req.model == "auto":
-        selection = choose_best_model(
-            series=cleaned,
-            pattern=pattern,
-            n_splits=req.n_splits,
-            horizon=req.evaluation_horizon,
-            season_length=req.season_length,
-        )
-        selected_model = selection["best"]["model"]
-        backtest_metrics = selection["best"]["metrics"]
-        backtest_config = selection["best"]["backtest_config"]
-        ranking = selection["ranking"]
-        excluded_models = selection["excluded_models"]
+        if backtest_possible:
+            selection = choose_best_model(
+                series=cleaned,
+                pattern=pattern,
+                n_splits=effective_splits,
+                horizon=effective_horizon,
+                season_length=req.season_length,
+            )
+            best_model = selection["best"]["model"]
+            ranking = selection["ranking"]
+            excluded_models = selection["excluded_models"]
+            backtest_config = selection["best"]["backtest_config"]
+        else:
+            best_model = fallback_model_for_short_history(cleaned, pattern, req.season_length)
+            ranking, excluded_models = build_short_history_ranking(
+                cleaned=cleaned,
+                pattern=pattern,
+                periods=req.periods,
+                season_length=req.season_length,
+                trend_factor=req.trend_factor,
+                forecast_start_month=req.forecast_start_month,
+            )
+            if not ranking:
+                raise ValueError("Kein zulässiges Modell für kurze Historie verfügbar.")
+            backtest_config = {
+                "splits": 0,
+                "horizon": effective_horizon,
+                "backtest_available": False,
+                "reason": "Zu wenig Historie für belastbares Backtesting. Forecast wurde dennoch erstellt.",
+            }
 
     else:
         if not model_is_allowed(req.model, cleaned, pattern, req.season_length):
             raise ValueError(f"Modell '{req.model}' ist für diese Zeitreihe nicht zulässig.")
 
-        evaluation = evaluate_model_rolling(
-            series=cleaned,
-            model_name=req.model,
-            pattern=pattern,
-            n_splits=req.n_splits,
-            horizon=req.evaluation_horizon,
-            season_length=req.season_length,
+        best_model = req.model
+
+        if backtest_possible:
+            evaluation = evaluate_model_rolling(
+                series=cleaned,
+                model_name=req.model,
+                pattern=pattern,
+                n_splits=effective_splits,
+                horizon=effective_horizon,
+                season_length=req.season_length,
+            )
+            ranking = [evaluation]
+            backtest_config = evaluation["backtest_config"]
+        else:
+            fc = run_model(best_model, cleaned, req.periods, season_length=req.season_length)
+            fc = apply_business_adjustments(
+                forecast=fc,
+                start_month=req.forecast_start_month,
+                seasonal_factors=SEASONAL_FACTORS,
+                trend_factor=req.trend_factor,
+            )
+            ranking = [{
+                "model": best_model,
+                "metrics": metrics_none(),
+                "forecast": round_forecast(fc),
+            }]
+            backtest_config = {
+                "splits": 0,
+                "horizon": effective_horizon,
+                "backtest_available": False,
+                "reason": "Zu wenig Historie für belastbares Backtesting.",
+            }
+
+    selected_model = best_model
+    model_switch_suggested = False
+    suggested_model = None
+    switch_reason = None
+    manual_confirmation_required = False
+    model_change_applied = False
+
+    if req.model == "auto" and req.prefer_established_model and established_model:
+        if model_is_allowed(established_model, cleaned, pattern, req.season_length):
+            if established_model != best_model:
+                suggestion = should_suggest_model_switch(
+                    established_model=established_model,
+                    established_metrics=established_metrics,
+                    best_model=best_model,
+                    best_metrics=ranking[0]["metrics"] if ranking else metrics_none(),
+                )
+                if suggestion:
+                    model_switch_suggested = True
+                    suggested_model = best_model
+                    switch_reason = (
+                        f"Für SKU '{req.sku}' ist '{established_model}' etabliert. "
+                        f"'{best_model}' erscheint leistungsfähiger. "
+                        f"Ein Modellwechsel erfordert eine manuelle Bestätigung."
+                    )
+                    manual_confirmation_required = True
+
+                if req.allow_model_change and req.confirm_model_change_to == best_model:
+                    selected_model = best_model
+                    model_change_applied = True
+                    set_established_model(
+                        sku=req.sku,
+                        model=best_model,
+                        metrics=ranking[0]["metrics"] if ranking else None,
+                        source="manual_confirmation",
+                    )
+                else:
+                    selected_model = established_model
+            else:
+                selected_model = established_model
+        else:
+            selected_model = best_model
+    elif req.allow_model_change and req.confirm_model_change_to:
+        if req.confirm_model_change_to != best_model and req.confirm_model_change_to != selected_model:
+            raise ValueError("confirm_model_change_to entspricht keinem zulässigen vorgeschlagenen Modell.")
+        selected_model = req.confirm_model_change_to
+        model_change_applied = True
+        set_established_model(
+            sku=req.sku,
+            model=selected_model,
+            metrics=ranking[0]["metrics"] if ranking else None,
+            source="manual_confirmation",
         )
-        selected_model = req.model
-        backtest_metrics = evaluation["metrics"]
-        backtest_config = evaluation["backtest_config"]
-        ranking = [evaluation]
-        excluded_models = []
 
     final_forecast = run_model(selected_model, cleaned, req.periods, season_length=req.season_length)
     final_forecast = apply_business_adjustments(
@@ -1108,35 +1445,75 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
         trend_factor=req.trend_factor,
     )
 
+    if req.save_selected_model_as_established and not established_model:
+        set_established_model(
+            sku=req.sku,
+            model=selected_model,
+            metrics=ranking[0]["metrics"] if ranking else None,
+            source="explicit_save",
+        )
+
+    top_3_forecasts = build_top_3_forecasts_from_ranking(
+        ranking=ranking,
+        cleaned=cleaned,
+        periods=req.periods,
+        season_length=req.season_length,
+        trend_factor=req.trend_factor,
+        forecast_start_month=req.forecast_start_month,
+    )
+
+    ranking_top_8 = ranking[:8]
+    model_ranking = [
+        {
+            "model": item["model"],
+            "mae": item["metrics"].get("mae"),
+            "wape": item["metrics"].get("wape"),
+            "mase": item["metrics"].get("mase"),
+            "bias": item["metrics"].get("bias"),
+        }
+        for item in ranking_top_8
+    ]
+
+    selected_metrics = next(
+        (
+            item["metrics"]
+            for item in ranking
+            if item["model"] == selected_model
+        ),
+        metrics_none(),
+    )
+
     return build_success_response(
         sku=req.sku,
         model=selected_model,
         forecast=round_forecast(final_forecast),
         metrics={
-            "mae": round(backtest_metrics["mae"], 2),
-            "wape": round(backtest_metrics["wape"], 4),
-            "mase": round(backtest_metrics["mase"], 4),
-            "bias": round(backtest_metrics["bias"], 2),
+            "mae": selected_metrics.get("mae"),
+            "wape": selected_metrics.get("wape"),
+            "mase": selected_metrics.get("mase"),
+            "bias": selected_metrics.get("bias"),
         },
         analysis=analysis,
         backtest_config=backtest_config,
-        model_ranking=[
-            {
-                "model": item["model"],
-                "mae": round(item["metrics"]["mae"], 2),
-                "wape": round(item["metrics"]["wape"], 4),
-                "mase": round(item["metrics"]["mase"], 4),
-                "bias": round(item["metrics"]["bias"], 2),
-            }
-            for item in ranking
-        ],
+        model_ranking=model_ranking,
+        top_3_forecasts=top_3_forecasts,
         excluded_models=excluded_models,
         preprocessing=preprocessing,
+        established_model_info={
+            "sku_has_established_model": bool(established_model),
+            "established_model": established_model,
+            "selected_model": selected_model,
+            "model_switch_suggested": model_switch_suggested,
+            "suggested_model": suggested_model,
+            "switch_reason": switch_reason,
+            "manual_confirmation_required": manual_confirmation_required,
+            "model_change_applied": model_change_applied,
+        },
     )
 
 
 # =========================================================
-# File helpers
+# FILE HELPERS
 # =========================================================
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -1211,28 +1588,50 @@ def build_output_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
         metrics = result.get("metrics", {})
         analysis = result.get("analysis", {})
         ranking = result.get("model_ranking", [])
+        top3 = result.get("top_3_forecasts", [])
+        established = result.get("established_model_info", {})
 
         forecast_values = result.get("forecast", [])
         for i, value in enumerate(forecast_values, start=1):
-            rows.append(
-                {
-                    "SKU": sku,
-                    "Forecast_Period": i,
-                    "Forecast": value,
-                    "Selected_Model": model,
-                    "MAE": metrics.get("mae"),
-                    "WAPE": metrics.get("wape"),
-                    "MASE": metrics.get("mase"),
-                    "BIAS": metrics.get("bias"),
-                    "Demand_Pattern": analysis.get("demand_pattern"),
-                    "ADI": analysis.get("adi"),
-                    "CV2": analysis.get("cv2"),
-                    "Outlier_Count": analysis.get("outlier_count"),
-                    "Trend_Factor": analysis.get("trend_factor"),
-                    "Forecast_Start_Month": analysis.get("forecast_start_month"),
-                    "Top_Ranked_Model": ranking[0]["model"] if ranking else model,
-                }
-            )
+            row: Dict[str, Any] = {
+                "SKU": sku,
+                "Selected_Model": model,
+                "Forecast_Period": i,
+                "Forecast": value,
+                "MAE": metrics.get("mae"),
+                "WAPE": metrics.get("wape"),
+                "MASE": metrics.get("mase"),
+                "BIAS": metrics.get("bias"),
+                "Demand_Pattern": analysis.get("demand_pattern"),
+                "ADI": analysis.get("adi"),
+                "CV2": analysis.get("cv2"),
+                "Outlier_Count": analysis.get("outlier_count"),
+                "Trend_Factor": analysis.get("trend_factor"),
+                "Forecast_Start_Month": analysis.get("forecast_start_month"),
+                "Established_Model": established.get("established_model"),
+                "Model_Switch_Suggested": established.get("model_switch_suggested"),
+                "Suggested_Model": established.get("suggested_model"),
+                "Manual_Confirmation_Required": established.get("manual_confirmation_required"),
+                "Top_Ranked_Model": ranking[0]["model"] if ranking else model,
+            }
+
+            for idx, item in enumerate(top3[:3], start=1):
+                fc = item.get("forecast", [])
+                row[f"Top{idx}_Model"] = item.get("model")
+                row[f"Top{idx}_MAE"] = item.get("metrics", {}).get("mae")
+                row[f"Top{idx}_WAPE"] = item.get("metrics", {}).get("wape")
+                row[f"Top{idx}_MASE"] = item.get("metrics", {}).get("mase")
+                row[f"Top{idx}_BIAS"] = item.get("metrics", {}).get("bias")
+                row[f"Top{idx}_Forecast"] = fc[i - 1] if i - 1 < len(fc) else None
+
+            for idx, item in enumerate(ranking[:8], start=1):
+                row[f"Rank{idx}_Model"] = item.get("model")
+                row[f"Rank{idx}_MAE"] = item.get("mae")
+                row[f"Rank{idx}_WAPE"] = item.get("wape")
+                row[f"Rank{idx}_MASE"] = item.get("mase")
+                row[f"Rank{idx}_BIAS"] = item.get("bias")
+
+            rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -1275,6 +1674,35 @@ def root() -> Dict[str, str]:
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "healthy"}
+
+
+@app.get("/model-binding/{sku}")
+def get_model_binding(
+    sku: str,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    verify_bearer_token(authorization)
+    established = get_established_model(sku)
+    return {
+        "sku": sku,
+        "binding_exists": bool(established),
+        "binding": established,
+    }
+
+
+@app.post("/model-binding/{sku}")
+def set_model_binding_endpoint(
+    sku: str,
+    model: str = Form(...),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    verify_bearer_token(authorization)
+    set_established_model(sku=sku, model=model, metrics=None, source="manual_endpoint")
+    return {
+        "status": "success",
+        "sku": sku,
+        "established_model": model,
+    }
 
 
 @app.post(
@@ -1323,6 +1751,10 @@ async def forecast_file(
     season_length: int = Form(12),
     forecast_start_month: int = Form(1),
     output_format: str = Form("same"),
+    prefer_established_model: bool = Form(True),
+    allow_model_change: bool = Form(False),
+    confirm_model_change_to: str = Form(""),
+    save_selected_model_as_established: bool = Form(False),
 ):
     verify_bearer_token(authorization)
 
@@ -1373,6 +1805,10 @@ async def forecast_file(
                 season_length=season_length,
                 trend_factor=trend_factor,
                 forecast_start_month=forecast_start_month,
+                prefer_established_model=prefer_established_model,
+                allow_model_change=allow_model_change,
+                confirm_model_change_to=confirm_model_change_to or None,
+                save_selected_model_as_established=save_selected_model_as_established,
             )
 
             result = compute_forecast_from_request(req)
