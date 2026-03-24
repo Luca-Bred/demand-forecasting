@@ -22,7 +22,7 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="Demand Forecast API", version="9.0.0")
+app = FastAPI(title="Demand Forecast API", version="10.0.0")
 
 
 # =========================================================
@@ -80,7 +80,7 @@ class AnalysisModel(BaseModel):
     cv2: Optional[float]
     outlier_count: int
     outlier_flags: List[int]
-    yearly_trend: float
+    trend_factor: float
     forecast_start_month: int
 
 
@@ -125,7 +125,7 @@ class ForecastRequest(BaseModel):
     evaluation_horizon: int = Field(default=6, ge=1, le=15)
     n_splits: int = Field(default=3, ge=1, le=6)
     season_length: int = Field(default=12, ge=2, le=24)
-    yearly_trend: float = Field(default=0.0, ge=-0.95, le=5.0)
+    trend_factor: float = Field(default=1.0, ge=0.01, le=10.0)
     forecast_start_month: int = Field(default=1, ge=1, le=12)
 
 
@@ -633,14 +633,14 @@ def apply_business_adjustments(
     forecast: List[float],
     start_month: int,
     seasonal_factors: Dict[int, float],
-    yearly_trend: float = 0.0,
+    trend_factor: float = 1.0,
 ) -> List[float]:
     adjusted: List[float] = []
 
     for i, value in enumerate(forecast):
         month = ((start_month - 1 + i) % 12) + 1
         season_factor = float(seasonal_factors.get(month, 1.0))
-        monthly_trend_factor = (1.0 + yearly_trend) ** (i / 12.0)
+        monthly_trend_factor = trend_factor ** (i / 12.0)
 
         new_val = float(value) * season_factor * monthly_trend_factor
         adjusted.append(max(0.0, new_val))
@@ -949,7 +949,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
                 "cv2": None,
                 "outlier_count": prep["outlier_count"],
                 "outlier_flags": prep["outlier_flags"],
-                "yearly_trend": req.yearly_trend,
+                "trend_factor": req.trend_factor,
                 "forecast_start_month": req.forecast_start_month,
             },
             backtest_config={"splits": 0, "horizon": 0},
@@ -970,7 +970,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
                 "cv2": None,
                 "outlier_count": prep["outlier_count"],
                 "outlier_flags": prep["outlier_flags"],
-                "yearly_trend": req.yearly_trend,
+                "trend_factor": req.trend_factor,
                 "forecast_start_month": req.forecast_start_month,
             },
             backtest_config={"splits": 0, "horizon": 0},
@@ -991,7 +991,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
         "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
         "outlier_count": prep["outlier_count"],
         "outlier_flags": prep["outlier_flags"],
-        "yearly_trend": req.yearly_trend,
+        "trend_factor": req.trend_factor,
         "forecast_start_month": req.forecast_start_month,
     }
 
@@ -1007,7 +1007,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             forecast=final_forecast,
             start_month=req.forecast_start_month,
             seasonal_factors=SEASONAL_FACTORS,
-            yearly_trend=req.yearly_trend,
+            trend_factor=req.trend_factor,
         )
 
         return build_success_response(
@@ -1029,7 +1029,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             forecast=final_forecast,
             start_month=req.forecast_start_month,
             seasonal_factors=SEASONAL_FACTORS,
-            yearly_trend=req.yearly_trend,
+            trend_factor=req.trend_factor,
         )
 
         return build_success_response(
@@ -1099,7 +1099,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
         forecast=final_forecast,
         start_month=req.forecast_start_month,
         seasonal_factors=SEASONAL_FACTORS,
-        yearly_trend=req.yearly_trend,
+        trend_factor=req.trend_factor,
     )
 
     return build_success_response(
@@ -1186,20 +1186,28 @@ def detect_required_columns(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
     return sku_col, demand_col, date_col
 
 
+def detect_file_format(filename: str) -> str:
+    lower = (filename or "").lower()
+    if lower.endswith(".csv"):
+        return "csv"
+    if lower.endswith(".xlsx"):
+        return "xlsx"
+    raise ValueError("Nur CSV oder XLSX als Input erlaubt.")
+
+
 def read_input_file(file: UploadFile) -> pd.DataFrame:
-    filename = (file.filename or "").lower()
+    input_format = detect_file_format(file.filename or "")
 
     try:
-        if filename.endswith(".csv"):
-            file.file.seek(0)
+        file.file.seek(0)
+        if input_format == "csv":
             return pd.read_csv(file.file)
-        if filename.endswith(".xlsx"):
-            file.file.seek(0)
+        if input_format == "xlsx":
             return pd.read_excel(file.file)
-
-        raise ValueError("Nur CSV oder XLSX als Input erlaubt.")
     except Exception as exc:
         raise ValueError(f"Fehler beim Lesen der Datei: {exc}") from exc
+
+    raise ValueError("Nur CSV oder XLSX als Input erlaubt.")
 
 
 def build_output_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -1228,7 +1236,7 @@ def build_output_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
                     "ADI": analysis.get("adi"),
                     "CV2": analysis.get("cv2"),
                     "Outlier_Count": analysis.get("outlier_count"),
-                    "Yearly_Trend": analysis.get("yearly_trend"),
+                    "Trend_Factor": analysis.get("trend_factor"),
                     "Forecast_Start_Month": analysis.get("forecast_start_month"),
                     "Top_Ranked_Model": ranking[0]["model"] if ranking else model,
                 }
@@ -1261,7 +1269,7 @@ def dataframe_to_file_response(df: pd.DataFrame, output_format: str) -> Streamin
             headers={"Content-Disposition": "attachment; filename=forecast_output.xlsx"},
         )
 
-    raise ValueError("output_format muss 'csv' oder 'xlsx' sein.")
+    raise ValueError("output_format muss 'csv', 'xlsx' oder 'same' sein.")
 
 
 # =========================================================
@@ -1308,7 +1316,7 @@ def forecast(req: ForecastRequest) -> Dict[str, Any]:
 @app.post("/forecast-file")
 async def forecast_file(
     file: UploadFile = File(...),
-    yearly_trend: float = Form(0.0),
+    trend_factor: float = Form(1.0),
     periods: int = Form(15),
     model: str = Form("auto"),
     locked_model: str = Form(""),
@@ -1316,11 +1324,15 @@ async def forecast_file(
     n_splits: int = Form(3),
     season_length: int = Form(12),
     forecast_start_month: int = Form(1),
-    output_format: str = Form("xlsx"),
+    output_format: str = Form("same"),
 ):
     try:
         if not file.filename:
             raise HTTPException(status_code=400, detail="Es wurde keine Datei übergeben.")
+
+        input_format = detect_file_format(file.filename)
+        if output_format.lower().strip() == "same":
+            output_format = input_format
 
         df = read_input_file(file)
         df = normalize_columns(df)
@@ -1359,7 +1371,7 @@ async def forecast_file(
                 evaluation_horizon=evaluation_horizon,
                 n_splits=n_splits,
                 season_length=season_length,
-                yearly_trend=yearly_trend,
+                trend_factor=trend_factor,
                 forecast_start_month=forecast_start_month,
             )
 
