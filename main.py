@@ -25,7 +25,8 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="Demand Forecast API", version="11.0.0")
+app = FastAPI(title="Demand Forecast API", version="11.1.0")
+
 
 # =========================================================
 # AUTH
@@ -260,8 +261,8 @@ def validate_inputs(
 ) -> None:
     if len(demand) == 0:
         raise ValueError("demand darf nicht leer sein.")
-    if len(demand) < 2:
-        raise ValueError("Für eine Prognose werden mindestens 2 Werte benötigt.")
+    if len(demand) < 1:
+        raise ValueError("Für eine Prognose wird mindestens 1 Wert benötigt.")
     if not all(isinstance(x, (int, float)) for x in demand):
         raise ValueError("Alle demand-Werte müssen numerisch sein.")
     if any(not math.isfinite(float(x)) for x in demand):
@@ -439,6 +440,8 @@ def mase(actual: List[float], predicted: List[float], train: List[float], m: int
 # FORECAST MODELS
 # =========================================================
 def naive_forecast(train: List[float], periods: int) -> List[float]:
+    if len(train) == 0:
+        return [0.0] * periods
     last_value = float(train[-1])
     return [last_value] * periods
 
@@ -459,6 +462,9 @@ def seasonal_naive_forecast(train: List[float], periods: int, season_length: int
 
 def moving_average_forecast(train: List[float], periods: int, window: int = 3) -> List[float]:
     history = list(map(float, train))
+    if len(history) == 0:
+        return [0.0] * periods
+
     forecasts: List[float] = []
 
     for _ in range(periods):
@@ -471,6 +477,9 @@ def moving_average_forecast(train: List[float], periods: int, window: int = 3) -
 
 
 def ets_forecast(train: List[float], periods: int) -> List[float]:
+    if len(train) < 2:
+        return naive_forecast(train, periods)
+
     model = SimpleExpSmoothing(
         np.asarray(train, dtype=float),
         initialization_method="estimated",
@@ -481,6 +490,9 @@ def ets_forecast(train: List[float], periods: int) -> List[float]:
 
 
 def holt_forecast(train: List[float], periods: int) -> List[float]:
+    if len(train) < 2:
+        return naive_forecast(train, periods)
+
     model = Holt(
         np.asarray(train, dtype=float),
         initialization_method="estimated",
@@ -507,6 +519,9 @@ def holt_winters_forecast(train: List[float], periods: int, season_length: int =
 
 
 def arima_forecast(train: List[float], periods: int, order: Tuple[int, int, int] = (1, 1, 1)) -> List[float]:
+    if len(train) < 3:
+        return naive_forecast(train, periods)
+
     model = SARIMAX(
         np.asarray(train, dtype=float),
         order=order,
@@ -802,6 +817,10 @@ def model_is_allowed(model_name: str, train: List[float], pattern: str, season_l
     n = len(train)
     non_zero = count_nonzero(train)
 
+    # Kurze Reihen: nur einfache Modelle
+    if n < 12:
+        return model_name in ("naive", "moving_average", "ets", "holt")
+
     if model_name == "naive":
         return n >= 1
     if model_name == "seasonal_naive":
@@ -809,9 +828,9 @@ def model_is_allowed(model_name: str, train: List[float], pattern: str, season_l
     if model_name == "moving_average":
         return n >= 3
     if model_name == "ets":
-        return n >= 4
+        return n >= 2
     if model_name == "holt":
-        return n >= 6
+        return n >= 2
     if model_name == "holt_winters":
         return n >= season_length * 2
     if model_name == "arima":
@@ -841,29 +860,56 @@ def model_is_allowed(model_name: str, train: List[float], pattern: str, season_l
 # =========================================================
 # ROLLING BACKTESTING
 # =========================================================
-def generate_rolling_splits(
+def determine_backtest_config(
     series: List[float],
-    n_splits: int = 3,
-    horizon: int = 6,
-    min_train_size: int = 6,
-) -> List[Tuple[List[float], List[float]]]:
-    splits: List[Tuple[List[float], List[float]]] = []
+    requested_horizon: int,
+    requested_splits: int,
+) -> Tuple[int, int]:
     n = len(series)
 
-    if n <= horizon + min_train_size:
-        return splits
+    if n <= 1:
+        return 1, 1
 
-    possible_origins = list(range(min_train_size, n - horizon + 1))
-    if not possible_origins:
-        return splits
+    if n < 12:
+        horizon = min(3, n - 1)
+    else:
+        horizon = min(requested_horizon, n - 1)
 
-    selected_origins = possible_origins[-n_splits:]
+    max_possible_splits = max(1, n - horizon - 1)
+    splits = min(requested_splits, max_possible_splits)
 
-    for origin in selected_origins:
+    return max(1, horizon), max(1, splits)
+
+
+def generate_rolling_splits(
+    series: List[float],
+    n_splits: int,
+    horizon: int,
+) -> List[Tuple[List[float], List[float]]]:
+    n = len(series)
+    splits: List[Tuple[List[float], List[float]]] = []
+
+    if n <= 1:
+        return [(series, series)]
+
+    max_origin = n - horizon
+    if max_origin <= 1:
+        return [(series[:-1], series[-1:])]
+
+    origins = list(range(1, max_origin))
+    selected = origins[-n_splits:] if len(origins) >= n_splits else origins
+
+    for origin in selected:
         train = series[:origin]
         test = series[origin:origin + horizon]
-        if len(test) == horizon:
-            splits.append((train, test))
+
+        if len(test) == 0:
+            continue
+
+        splits.append((train, test))
+
+    if not splits:
+        splits.append((series[:-1], series[-1:]))
 
     return splits
 
@@ -872,52 +918,53 @@ def evaluate_model_rolling(
     series: List[float],
     model_name: str,
     pattern: str,
-    n_splits: int = 3,
-    horizon: int = 6,
+    n_splits: int,
+    horizon: int,
     season_length: int = 12,
 ) -> Dict[str, Any]:
-    min_train_size = max(6, min(season_length, max(6, len(series) - horizon - 1)))
-    splits = generate_rolling_splits(
-        series=series,
-        n_splits=n_splits,
-        horizon=horizon,
-        min_train_size=min_train_size,
-    )
-
-    if not splits:
-        raise ValueError("Zu wenig Historie für Rolling Backtesting.")
+    horizon, n_splits = determine_backtest_config(series, horizon, n_splits)
+    splits = generate_rolling_splits(series, n_splits, horizon)
 
     split_results: List[Dict[str, Any]] = []
 
     for idx, (train, test) in enumerate(splits, start=1):
-        if not model_is_allowed(model_name, train, pattern, season_length=season_length):
-            raise ValueError(f"Modell '{model_name}' ist in Split {idx} nicht zulässig.")
+        if len(train) == 0 or len(test) == 0:
+            continue
 
-        preds = run_model(model_name, train, len(test), season_length=season_length)
-        preds = clip_non_negative(preds)
+        if not model_is_allowed(model_name, train, pattern, season_length):
+            continue
 
-        split_results.append(
-            {
-                "split": idx,
-                "mae": mae(test, preds),
-                "wape": wape(test, preds),
-                "mase": mase(test, preds, train, m=1),
-                "bias": bias(test, preds),
-            }
-        )
+        try:
+            preds = run_model(model_name, train, len(test), season_length=season_length)
+            preds = clip_non_negative(preds)
 
-    avg_mae = float(np.mean([x["mae"] for x in split_results]))
-    avg_wape = float(np.mean([x["wape"] for x in split_results]))
-    avg_mase = float(np.mean([x["mase"] for x in split_results]))
-    avg_bias = float(np.mean([x["bias"] for x in split_results]))
+            split_results.append(
+                {
+                    "split": idx,
+                    "mae": mae(test, preds),
+                    "wape": wape(test, preds),
+                    "mase": mase(test, preds, train, m=1),
+                    "bias": bias(test, preds),
+                }
+            )
+        except Exception:
+            continue
+
+    if not split_results:
+        return {
+            "model": model_name,
+            "metrics": {"mae": None, "wape": None, "mase": None, "bias": None},
+            "backtest_config": {"splits": 0, "horizon": horizon, "backtest_available": True},
+            "split_metrics": [],
+        }
 
     return {
         "model": model_name,
         "metrics": {
-            "mae": round(avg_mae, 2),
-            "wape": round(avg_wape, 4),
-            "mase": round(avg_mase, 4),
-            "bias": round(avg_bias, 2),
+            "mae": round(float(np.mean([x["mae"] for x in split_results])), 2),
+            "wape": round(float(np.mean([x["wape"] for x in split_results])), 4),
+            "mase": round(float(np.mean([x["mase"] for x in split_results])), 4),
+            "bias": round(float(np.mean([x["bias"] for x in split_results])), 2),
         },
         "backtest_config": {
             "splits": len(split_results),
@@ -935,30 +982,6 @@ def evaluate_model_rolling(
             for x in split_results
         ],
     }
-
-
-def safe_effective_backtest_params(
-    series: List[float],
-    requested_horizon: int,
-    requested_splits: int,
-    season_length: int,
-) -> Tuple[int, int, bool]:
-    n = len(series)
-    if n < 4:
-        return 1, 1, False
-
-    effective_horizon = min(requested_horizon, max(1, n - 2))
-    min_train_size = max(6, min(season_length, max(2, n - effective_horizon - 1)))
-    splits = generate_rolling_splits(
-        series=series,
-        n_splits=requested_splits,
-        horizon=effective_horizon,
-        min_train_size=min_train_size,
-    )
-    if not splits:
-        return effective_horizon, 1, False
-
-    return effective_horizon, min(len(splits), requested_splits), True
 
 
 def choose_best_model(
@@ -987,8 +1010,7 @@ def choose_best_model(
         "mlp",
     ]
 
-    ref_series = series[:-horizon] if len(series) > horizon else series[:-1] if len(series) > 1 else series
-    valid_models = [m for m in candidate_models if model_is_allowed(m, ref_series, pattern, season_length=season_length)]
+    valid_models = [m for m in candidate_models if model_is_allowed(m, series, pattern, season_length=season_length)]
 
     if not valid_models:
         raise ValueError("Keine zulässigen Modelle verfügbar.")
@@ -1015,10 +1037,9 @@ def choose_best_model(
 
     results.sort(
         key=lambda x: (
-            0 if (x["metrics"]["mase"] is not None and x["metrics"]["mase"] < 1) else 1,
+            1 if x["metrics"]["mase"] is None else (0 if x["metrics"]["mase"] < 1 else 1),
             x["metrics"]["wape"] if x["metrics"]["wape"] is not None else float("inf"),
             x["metrics"]["mae"] if x["metrics"]["mae"] is not None else float("inf"),
-            abs(x["metrics"]["bias"]) if x["metrics"]["bias"] is not None else float("inf"),
         )
     )
 
@@ -1075,54 +1096,6 @@ def fallback_model_for_short_history(cleaned: List[float], pattern: str, season_
     return "naive"
 
 
-def build_short_history_ranking(
-    cleaned: List[float],
-    pattern: str,
-    periods: int,
-    season_length: int,
-    trend_factor: float,
-    forecast_start_month: int,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    candidate_models = [
-        "naive",
-        "moving_average",
-        "ets",
-        "holt",
-        "seasonal_naive",
-        "arima",
-        "croston",
-        "sba",
-        "tsb",
-    ]
-    ranking: List[Dict[str, Any]] = []
-    excluded_models: List[Dict[str, Any]] = []
-
-    for model_name in candidate_models:
-        try:
-            if not model_is_allowed(model_name, cleaned, pattern, season_length):
-                raise ValueError("Modell für diese Historie nicht zulässig.")
-
-            fc = run_model(model_name, cleaned, periods, season_length=season_length)
-            fc = apply_business_adjustments(
-                forecast=fc,
-                start_month=forecast_start_month,
-                seasonal_factors=SEASONAL_FACTORS,
-                trend_factor=trend_factor,
-            )
-
-            ranking.append(
-                {
-                    "model": model_name,
-                    "metrics": metrics_none(),
-                    "forecast": round_forecast(fc),
-                }
-            )
-        except Exception as exc:
-            excluded_models.append({"model": model_name, "reason": str(exc)})
-
-    return ranking, excluded_models
-
-
 def build_top_3_forecasts_from_ranking(
     ranking: List[Dict[str, Any]],
     cleaned: List[float],
@@ -1136,17 +1109,13 @@ def build_top_3_forecasts_from_ranking(
     for rank, item in enumerate(ranking[:3], start=1):
         model_name = item["model"]
 
-        if "forecast" in item:
-            forecast_values = item["forecast"]
-        else:
-            fc = run_model(model_name, cleaned, periods, season_length=season_length)
-            fc = apply_business_adjustments(
-                forecast=fc,
-                start_month=forecast_start_month,
-                seasonal_factors=SEASONAL_FACTORS,
-                trend_factor=trend_factor,
-            )
-            forecast_values = round_forecast(fc)
+        fc = run_model(model_name, cleaned, periods, season_length=season_length)
+        fc = apply_business_adjustments(
+            forecast=fc,
+            start_month=forecast_start_month,
+            seasonal_factors=SEASONAL_FACTORS,
+            trend_factor=trend_factor,
+        )
 
         top_3.append(
             {
@@ -1158,7 +1127,7 @@ def build_top_3_forecasts_from_ranking(
                     "mase": item["metrics"].get("mase"),
                     "bias": item["metrics"].get("bias"),
                 },
-                "forecast": forecast_values,
+                "forecast": round_forecast(fc),
             }
         )
 
@@ -1192,7 +1161,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
                 "trend_factor": req.trend_factor,
                 "forecast_start_month": req.forecast_start_month,
             },
-            backtest_config={"splits": 0, "horizon": 0, "backtest_available": False},
+            backtest_config={"splits": 0, "horizon": 1, "backtest_available": True},
             model_ranking=[],
             top_3_forecasts=[],
             excluded_models=[],
@@ -1224,7 +1193,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
                 "trend_factor": req.trend_factor,
                 "forecast_start_month": req.forecast_start_month,
             },
-            backtest_config={"splits": 0, "horizon": 0, "backtest_available": False},
+            backtest_config={"splits": 0, "horizon": 1, "backtest_available": True},
             model_ranking=[],
             top_3_forecasts=[],
             excluded_models=[],
@@ -1266,13 +1235,6 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
     established_model = established.get("model") if established else None
     established_metrics = established.get("metrics") if established else None
 
-    effective_horizon, effective_splits, backtest_possible = safe_effective_backtest_params(
-        series=cleaned,
-        requested_horizon=req.evaluation_horizon,
-        requested_splits=req.n_splits,
-        season_length=req.season_length,
-    )
-
     ranking: List[Dict[str, Any]] = []
     excluded_models: List[Dict[str, str]] = []
     backtest_config: Dict[str, Any]
@@ -1283,106 +1245,45 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             raise ValueError(f"locked_model '{req.locked_model}' ist für diese Zeitreihe nicht zulässig.")
 
         best_model = req.locked_model
-
-        if backtest_possible:
-            evaluation = evaluate_model_rolling(
-                series=cleaned,
-                model_name=req.locked_model,
-                pattern=pattern,
-                n_splits=effective_splits,
-                horizon=effective_horizon,
-                season_length=req.season_length,
-            )
-            ranking = [evaluation]
-            backtest_config = evaluation["backtest_config"]
-        else:
-            fc = run_model(best_model, cleaned, req.periods, season_length=req.season_length)
-            fc = apply_business_adjustments(
-                forecast=fc,
-                start_month=req.forecast_start_month,
-                seasonal_factors=SEASONAL_FACTORS,
-                trend_factor=req.trend_factor,
-            )
-            ranking = [{
-                "model": best_model,
-                "metrics": metrics_none(),
-                "forecast": round_forecast(fc),
-            }]
-            backtest_config = {
-                "splits": 0,
-                "horizon": effective_horizon,
-                "backtest_available": False,
-                "reason": "Zu wenig Historie für belastbares Backtesting.",
-            }
+        evaluation = evaluate_model_rolling(
+            series=cleaned,
+            model_name=req.locked_model,
+            pattern=pattern,
+            n_splits=req.n_splits,
+            horizon=req.evaluation_horizon,
+            season_length=req.season_length,
+        )
+        ranking = [evaluation]
+        backtest_config = evaluation["backtest_config"]
 
     elif req.model == "auto":
-        if backtest_possible:
-            selection = choose_best_model(
-                series=cleaned,
-                pattern=pattern,
-                n_splits=effective_splits,
-                horizon=effective_horizon,
-                season_length=req.season_length,
-            )
-            best_model = selection["best"]["model"]
-            ranking = selection["ranking"]
-            excluded_models = selection["excluded_models"]
-            backtest_config = selection["best"]["backtest_config"]
-        else:
-            best_model = fallback_model_for_short_history(cleaned, pattern, req.season_length)
-            ranking, excluded_models = build_short_history_ranking(
-                cleaned=cleaned,
-                pattern=pattern,
-                periods=req.periods,
-                season_length=req.season_length,
-                trend_factor=req.trend_factor,
-                forecast_start_month=req.forecast_start_month,
-            )
-            if not ranking:
-                raise ValueError("Kein zulässiges Modell für kurze Historie verfügbar.")
-            backtest_config = {
-                "splits": 0,
-                "horizon": effective_horizon,
-                "backtest_available": False,
-                "reason": "Zu wenig Historie für belastbares Backtesting. Forecast wurde dennoch erstellt.",
-            }
+        selection = choose_best_model(
+            series=cleaned,
+            pattern=pattern,
+            n_splits=req.n_splits,
+            horizon=req.evaluation_horizon,
+            season_length=req.season_length,
+        )
+        best_model = selection["best"]["model"]
+        ranking = selection["ranking"]
+        excluded_models = selection["excluded_models"]
+        backtest_config = selection["best"]["backtest_config"]
 
     else:
         if not model_is_allowed(req.model, cleaned, pattern, req.season_length):
             raise ValueError(f"Modell '{req.model}' ist für diese Zeitreihe nicht zulässig.")
 
         best_model = req.model
-
-        if backtest_possible:
-            evaluation = evaluate_model_rolling(
-                series=cleaned,
-                model_name=req.model,
-                pattern=pattern,
-                n_splits=effective_splits,
-                horizon=effective_horizon,
-                season_length=req.season_length,
-            )
-            ranking = [evaluation]
-            backtest_config = evaluation["backtest_config"]
-        else:
-            fc = run_model(best_model, cleaned, req.periods, season_length=req.season_length)
-            fc = apply_business_adjustments(
-                forecast=fc,
-                start_month=req.forecast_start_month,
-                seasonal_factors=SEASONAL_FACTORS,
-                trend_factor=req.trend_factor,
-            )
-            ranking = [{
-                "model": best_model,
-                "metrics": metrics_none(),
-                "forecast": round_forecast(fc),
-            }]
-            backtest_config = {
-                "splits": 0,
-                "horizon": effective_horizon,
-                "backtest_available": False,
-                "reason": "Zu wenig Historie für belastbares Backtesting.",
-            }
+        evaluation = evaluate_model_rolling(
+            series=cleaned,
+            model_name=req.model,
+            pattern=pattern,
+            n_splits=req.n_splits,
+            horizon=req.evaluation_horizon,
+            season_length=req.season_length,
+        )
+        ranking = [evaluation]
+        backtest_config = evaluation["backtest_config"]
 
     selected_model = best_model
     model_switch_suggested = False
