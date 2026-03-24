@@ -22,7 +22,8 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="Demand Forecast API", version="8.1.0")
+app = FastAPI(title="Demand Forecast API", version="9.0.0")
+
 
 # =========================================================
 # Feste saisonale Faktoren
@@ -63,6 +64,58 @@ AllowedModel = Literal[
 ]
 
 
+# =========================================================
+# Response Models
+# =========================================================
+class MetricsModel(BaseModel):
+    mae: float
+    wape: float
+    mase: float
+    bias: float
+
+
+class AnalysisModel(BaseModel):
+    demand_pattern: str
+    adi: Optional[float]
+    cv2: Optional[float]
+    outlier_count: int
+    outlier_flags: List[int]
+    yearly_trend: float
+    forecast_start_month: int
+
+
+class ModelRankingItem(BaseModel):
+    model: str
+    mae: float
+    wape: float
+    mase: float
+    bias: float
+
+
+class PreprocessingModel(BaseModel):
+    original: List[float]
+    cleaned: List[float]
+
+
+class ForecastResponse(BaseModel):
+    status: str = "success"
+    sku: str
+    model: str
+    forecast: List[int]
+    metrics: MetricsModel
+    analysis: AnalysisModel
+    backtest_config: Dict[str, Any]
+    model_ranking: List[ModelRankingItem]
+    excluded_models: List[Dict[str, str]]
+    preprocessing: PreprocessingModel
+
+
+class ErrorResponse(BaseModel):
+    status: str = "failed"
+    reason: str
+    details: str
+
+
 class ForecastRequest(BaseModel):
     sku: str = Field(..., min_length=1, max_length=100)
     demand: List[float] = Field(..., min_length=1)
@@ -79,7 +132,6 @@ class ForecastRequest(BaseModel):
 # =========================================================
 # Validation & preprocessing
 # =========================================================
-
 def validate_inputs(
     demand: List[float],
     periods: int,
@@ -103,6 +155,8 @@ def validate_inputs(
         raise ValueError("n_splits muss >= 1 sein.")
     if season_length < 2:
         raise ValueError("season_length muss >= 2 sein.")
+    if evaluation_horizon >= len(demand):
+        raise ValueError("evaluation_horizon muss kleiner als die Länge von demand sein.")
 
 
 def clip_non_negative(values: List[float]) -> List[float]:
@@ -134,7 +188,6 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
     arr = np.asarray(series, dtype=float)
     flags = np.zeros(len(arr), dtype=int)
 
-    # negative Werte sind unplausibel
     flags[arr < 0] = 1
 
     non_zero = arr[arr > 0]
@@ -241,7 +294,6 @@ def detect_demand_pattern(series: List[float]) -> str:
 # =========================================================
 # Metrics
 # =========================================================
-
 def mae(actual: List[float], predicted: List[float]) -> float:
     if not actual:
         return 0.0
@@ -279,7 +331,6 @@ def mase(actual: List[float], predicted: List[float], train: List[float], m: int
 # =========================================================
 # Forecast models
 # =========================================================
-
 def naive_forecast(train: List[float], periods: int) -> List[float]:
     last_value = float(train[-1])
     return [last_value] * periods
@@ -441,7 +492,6 @@ def tsb_forecast(train: List[float], periods: int, alpha: float = 0.2, beta: flo
 # =========================================================
 # ML features
 # =========================================================
-
 def create_ml_features(series: List[float], season_length: int = 12) -> Tuple[np.ndarray, np.ndarray]:
     values = list(map(float, series))
     rows: List[List[float]] = []
@@ -579,7 +629,6 @@ def mlp_forecast(train: List[float], periods: int, season_length: int = 12) -> L
 # =========================================================
 # Business adjustments
 # =========================================================
-
 def apply_business_adjustments(
     forecast: List[float],
     start_month: int,
@@ -602,7 +651,6 @@ def apply_business_adjustments(
 # =========================================================
 # Model dispatcher
 # =========================================================
-
 def run_model(model_name: str, train: List[float], periods: int, season_length: int = 12) -> List[float]:
     if model_name == "naive":
         return naive_forecast(train, periods)
@@ -643,7 +691,6 @@ def run_model(model_name: str, train: List[float], periods: int, season_length: 
 # =========================================================
 # Model eligibility
 # =========================================================
-
 def model_is_allowed(model_name: str, train: List[float], pattern: str, season_length: int = 12) -> bool:
     n = len(train)
     non_zero = count_nonzero(train)
@@ -687,7 +734,6 @@ def model_is_allowed(model_name: str, train: List[float], pattern: str, season_l
 # =========================================================
 # Rolling backtesting
 # =========================================================
-
 def generate_rolling_splits(
     series: List[float],
     n_splits: int = 3,
@@ -854,6 +900,30 @@ def choose_best_model(
 # =========================================================
 # Forecast core
 # =========================================================
+def build_success_response(
+    sku: str,
+    model: str,
+    forecast: List[int],
+    metrics: Dict[str, float],
+    analysis: Dict[str, Any],
+    backtest_config: Dict[str, Any],
+    model_ranking: List[Dict[str, Any]],
+    excluded_models: List[Dict[str, str]],
+    preprocessing: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "status": "success",
+        "sku": sku,
+        "model": model,
+        "forecast": forecast,
+        "metrics": metrics,
+        "analysis": analysis,
+        "backtest_config": backtest_config,
+        "model_ranking": model_ranking,
+        "excluded_models": excluded_models,
+        "preprocessing": preprocessing,
+    }
+
 
 def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
     validate_inputs(
@@ -868,12 +938,12 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
     cleaned = prep["cleaned"]
 
     if len(cleaned) == 0:
-        return {
-            "sku": req.sku,
-            "model": "no_forecast",
-            "forecast": [],
-            "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
-            "analysis": {
+        return build_success_response(
+            sku=req.sku,
+            model="no_forecast",
+            forecast=[],
+            metrics={"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
+            analysis={
                 "demand_pattern": "no_demand",
                 "adi": None,
                 "cv2": None,
@@ -882,19 +952,19 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
                 "yearly_trend": req.yearly_trend,
                 "forecast_start_month": req.forecast_start_month,
             },
-            "backtest_config": {"splits": 0, "horizon": 0},
-            "model_ranking": [],
-            "excluded_models": [],
-            "preprocessing": {"original": prep["original"], "cleaned": []},
-        }
+            backtest_config={"splits": 0, "horizon": 0},
+            model_ranking=[],
+            excluded_models=[],
+            preprocessing={"original": prep["original"], "cleaned": []},
+        )
 
     if count_nonzero(cleaned) == 0:
-        return {
-            "sku": req.sku,
-            "model": "no_forecast",
-            "forecast": [0] * req.periods,
-            "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
-            "analysis": {
+        return build_success_response(
+            sku=req.sku,
+            model="no_forecast",
+            forecast=[0] * req.periods,
+            metrics={"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
+            analysis={
                 "demand_pattern": "all_zero",
                 "adi": None,
                 "cv2": None,
@@ -903,17 +973,32 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
                 "yearly_trend": req.yearly_trend,
                 "forecast_start_month": req.forecast_start_month,
             },
-            "backtest_config": {"splits": 0, "horizon": 0},
-            "model_ranking": [],
-            "excluded_models": [],
-            "preprocessing": {
+            backtest_config={"splits": 0, "horizon": 0},
+            model_ranking=[],
+            excluded_models=[],
+            preprocessing={
                 "original": prep["original"],
                 "cleaned": [round(x, 2) for x in cleaned],
             },
-        }
+        )
 
     pattern = detect_demand_pattern(cleaned)
     adi, cv2 = compute_adi_cv2(cleaned)
+
+    analysis = {
+        "demand_pattern": pattern,
+        "adi": round(adi, 4) if math.isfinite(adi) else None,
+        "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
+        "outlier_count": prep["outlier_count"],
+        "outlier_flags": prep["outlier_flags"],
+        "yearly_trend": req.yearly_trend,
+        "forecast_start_month": req.forecast_start_month,
+    }
+
+    preprocessing = {
+        "original": prep["original"],
+        "cleaned": [round(x, 2) for x in cleaned],
+    }
 
     if len(cleaned) < 4:
         selected_model = "naive"
@@ -925,29 +1010,17 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             yearly_trend=req.yearly_trend,
         )
 
-        return {
-            "sku": req.sku,
-            "model": selected_model,
-            "model_changed": False,
-            "forecast": round_forecast(final_forecast),
-            "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
-            "analysis": {
-                "demand_pattern": pattern,
-                "adi": round(adi, 4) if math.isfinite(adi) else None,
-                "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
-                "outlier_count": prep["outlier_count"],
-                "outlier_flags": prep["outlier_flags"],
-                "yearly_trend": req.yearly_trend,
-                "forecast_start_month": req.forecast_start_month,
-            },
-            "backtest_config": {"splits": 0, "horizon": 0},
-            "model_ranking": [],
-            "excluded_models": [],
-            "preprocessing": {
-                "original": prep["original"],
-                "cleaned": [round(x, 2) for x in cleaned],
-            },
-        }
+        return build_success_response(
+            sku=req.sku,
+            model=selected_model,
+            forecast=round_forecast(final_forecast),
+            metrics={"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
+            analysis=analysis,
+            backtest_config={"splits": 0, "horizon": 0},
+            model_ranking=[],
+            excluded_models=[],
+            preprocessing=preprocessing,
+        )
 
     if len(cleaned) < 8 and req.model == "auto" and req.locked_model is None:
         selected_model = "ets" if model_is_allowed("ets", cleaned, pattern, req.season_length) else "naive"
@@ -959,31 +1032,17 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             yearly_trend=req.yearly_trend,
         )
 
-        return {
-            "sku": req.sku,
-            "model": selected_model,
-            "model_changed": False,
-            "forecast": round_forecast(final_forecast),
-            "metrics": {"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
-            "analysis": {
-                "demand_pattern": pattern,
-                "adi": round(adi, 4) if math.isfinite(adi) else None,
-                "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
-                "outlier_count": prep["outlier_count"],
-                "outlier_flags": prep["outlier_flags"],
-                "yearly_trend": req.yearly_trend,
-                "forecast_start_month": req.forecast_start_month,
-            },
-            "backtest_config": {"splits": 0, "horizon": 0},
-            "model_ranking": [],
-            "excluded_models": [],
-            "preprocessing": {
-                "original": prep["original"],
-                "cleaned": [round(x, 2) for x in cleaned],
-            },
-        }
-
-    model_changed = False
+        return build_success_response(
+            sku=req.sku,
+            model=selected_model,
+            forecast=round_forecast(final_forecast),
+            metrics={"mae": 0.0, "wape": 0.0, "mase": 0.0, "bias": 0.0},
+            analysis=analysis,
+            backtest_config={"splits": 0, "horizon": 0},
+            model_ranking=[],
+            excluded_models=[],
+            preprocessing=preprocessing,
+        )
 
     if req.locked_model and req.locked_model != "auto":
         if not model_is_allowed(req.locked_model, cleaned, pattern, req.season_length):
@@ -1001,7 +1060,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
         backtest_metrics = evaluation["metrics"]
         backtest_config = evaluation["backtest_config"]
         ranking = [evaluation]
-        excluded_models = []
+        excluded_models: List[Dict[str, str]] = []
 
     elif req.model == "auto":
         selection = choose_best_model(
@@ -1043,28 +1102,19 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
         yearly_trend=req.yearly_trend,
     )
 
-    return {
-        "sku": req.sku,
-        "model": selected_model,
-        "model_changed": model_changed,
-        "forecast": round_forecast(final_forecast),
-        "metrics": {
+    return build_success_response(
+        sku=req.sku,
+        model=selected_model,
+        forecast=round_forecast(final_forecast),
+        metrics={
             "mae": round(backtest_metrics["mae"], 2),
             "wape": round(backtest_metrics["wape"], 4),
             "mase": round(backtest_metrics["mase"], 4),
             "bias": round(backtest_metrics["bias"], 2),
         },
-        "analysis": {
-            "demand_pattern": pattern,
-            "adi": round(adi, 4) if math.isfinite(adi) else None,
-            "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
-            "outlier_count": prep["outlier_count"],
-            "outlier_flags": prep["outlier_flags"],
-            "yearly_trend": req.yearly_trend,
-            "forecast_start_month": req.forecast_start_month,
-        },
-        "backtest_config": backtest_config,
-        "model_ranking": [
+        analysis=analysis,
+        backtest_config=backtest_config,
+        model_ranking=[
             {
                 "model": item["model"],
                 "mae": round(item["metrics"]["mae"], 2),
@@ -1074,41 +1124,43 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             }
             for item in ranking
         ],
-        "excluded_models": excluded_models,
-        "preprocessing": {
-            "original": prep["original"],
-            "cleaned": [round(x, 2) for x in cleaned],
-        },
-    }
+        excluded_models=excluded_models,
+        preprocessing=preprocessing,
+    )
 
 
 # =========================================================
 # File helpers
 # =========================================================
-
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def detect_required_columns(df: pd.DataFrame) -> Tuple[str, str]:
+def detect_required_columns(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
     """
-    Erwartet Pflichtspalten:
+    Pflichtspalten:
     - SKU
     - Verbrauch
+
+    Optionale Zeitspalte:
+    - Datum / Periode
 
     Zulässige Aliasnamen:
     SKU: SKU, sku, Artikel, artikel
     Verbrauch: Verbrauch, verbrauch, Demand, demand, Menge, menge
+    Datum: Datum, datum, Date, date, Periode, periode, Period, period, Monat, monat
     """
     col_map = {c.lower(): c for c in df.columns}
 
     sku_candidates = ["sku", "artikel"]
     demand_candidates = ["verbrauch", "demand", "menge"]
+    date_candidates = ["datum", "date", "periode", "period", "monat"]
 
     sku_col = None
     demand_col = None
+    date_col = None
 
     for c in sku_candidates:
         if c in col_map:
@@ -1120,24 +1172,34 @@ def detect_required_columns(df: pd.DataFrame) -> Tuple[str, str]:
             demand_col = col_map[c]
             break
 
+    for c in date_candidates:
+        if c in col_map:
+            date_col = col_map[c]
+            break
+
     if sku_col is None or demand_col is None:
         raise ValueError(
             "Datei muss Spalten für SKU und Verbrauch enthalten. "
             "Erlaubte Namen: SKU/Artikel und Verbrauch/Demand/Menge."
         )
 
-    return sku_col, demand_col
+    return sku_col, demand_col, date_col
 
 
 def read_input_file(file: UploadFile) -> pd.DataFrame:
     filename = (file.filename or "").lower()
 
-    if filename.endswith(".csv"):
-        return pd.read_csv(file.file)
-    if filename.endswith(".xlsx"):
-        return pd.read_excel(file.file)
+    try:
+        if filename.endswith(".csv"):
+            file.file.seek(0)
+            return pd.read_csv(file.file)
+        if filename.endswith(".xlsx"):
+            file.file.seek(0)
+            return pd.read_excel(file.file)
 
-    raise ValueError("Nur CSV oder XLSX als Input erlaubt.")
+        raise ValueError("Nur CSV oder XLSX als Input erlaubt.")
+    except Exception as exc:
+        raise ValueError(f"Fehler beim Lesen der Datei: {exc}") from exc
 
 
 def build_output_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -1205,7 +1267,6 @@ def dataframe_to_file_response(df: pd.DataFrame, output_format: str) -> Streamin
 # =========================================================
 # API
 # =========================================================
-
 @app.get("/")
 def root() -> Dict[str, str]:
     return {"status": "ok", "message": "Demand Forecast API läuft"}
@@ -1216,17 +1277,32 @@ def health() -> Dict[str, str]:
     return {"status": "healthy"}
 
 
-@app.post("/forecast")
+@app.post(
+    "/forecast",
+    response_model=ForecastResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
 def forecast(req: ForecastRequest) -> Dict[str, Any]:
     try:
         return compute_forecast_from_request(req)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "failed",
+                "reason": "forecast_validation_error",
+                "details": str(exc),
+            },
+        ) from exc
     except Exception as exc:
-        return {
-            "sku": req.sku if hasattr(req, "sku") else "",
-            "status": "failed",
-            "reason": "forecast_error",
-            "details": str(exc),
-        }
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "failed",
+                "reason": "forecast_internal_error",
+                "details": str(exc),
+            },
+        ) from exc
 
 
 @app.post("/forecast-file")
@@ -1252,11 +1328,19 @@ async def forecast_file(
         if df.empty:
             raise HTTPException(status_code=400, detail="Die Eingabedatei ist leer.")
 
-        sku_col, demand_col = detect_required_columns(df)
+        sku_col, demand_col, date_col = detect_required_columns(df)
 
-        df = df[[sku_col, demand_col]].copy()
+        use_cols = [sku_col, demand_col] + ([date_col] if date_col else [])
+        df = df[use_cols].copy()
+
         df[demand_col] = pd.to_numeric(df[demand_col], errors="coerce")
         df = df.dropna(subset=[sku_col, demand_col])
+
+        if date_col:
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            df = df.sort_values(by=[sku_col, date_col], kind="stable")
+        else:
+            df = df.reset_index(drop=True)
 
         if df.empty:
             raise HTTPException(status_code=400, detail="Keine verwertbaren Daten nach Bereinigung vorhanden.")
@@ -1287,5 +1371,7 @@ async def forecast_file(
 
     except HTTPException:
         raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
