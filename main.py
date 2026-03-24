@@ -29,7 +29,7 @@ app = FastAPI(title="Demand Forecast API", version="10.1.0")
 # =========================================================
 # AUTH
 # =========================================================
-API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "").strip()
+API_BEARER_TOKEN = os.getenv("forecast_prod_1893", "").strip()
 
 
 def verify_bearer_token(authorization: Optional[str]) -> None:
