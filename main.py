@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from sklearn.ensemble import (
     ExtraTreesRegressor,
     GradientBoostingRegressor,
@@ -25,7 +25,7 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 warnings.filterwarnings("ignore")
 
-app = FastAPI(title="Demand Forecast API", version="11.2.0")
+app = FastAPI(title="Demand Forecast API", version="12.0.0")
 
 
 # =========================================================
@@ -125,18 +125,18 @@ def should_suggest_model_switch(
 # KONFIGURATION
 # =========================================================
 SEASONAL_FACTORS: Dict[int, float] = {
-    1: 0.86,
-    2: 1.03,
-    3: 1.20,
-    4: 1.16,
-    5: 1.26,
-    6: 1.28,
-    7: 1.19,
-    8: 1.08,
-    9: 1.05,
-    10: 0.93,
-    11: 0.57,
-    12: 0.40,
+    1: 1.00,
+    2: 0.86,
+    3: 1.03,
+    4: 1.20,
+    5: 1.16,
+    6: 1.26,
+    7: 1.28,
+    8: 1.19,
+    9: 1.08,
+    10: 1.05,
+    11: 0.93,
+    12: 0.57,
 }
 
 AllowedModel = Literal[
@@ -168,6 +168,9 @@ class MetricsModel(BaseModel):
     wape: Optional[float]
     mase: Optional[float]
     bias: Optional[float]
+    mean_error: Optional[float]
+    mape: Optional[float]
+    error_std: Optional[float]
 
 
 class AnalysisModel(BaseModel):
@@ -176,8 +179,10 @@ class AnalysisModel(BaseModel):
     cv2: Optional[float]
     outlier_count: int
     outlier_flags: List[int]
-    trend_factor: float
+    prognosefaktor: float
     forecast_start_month: int
+    seasonal_factor_source: str
+    seasonal_override_applied: bool
 
 
 class ModelRankingItem(BaseModel):
@@ -186,12 +191,17 @@ class ModelRankingItem(BaseModel):
     wape: Optional[float]
     mase: Optional[float]
     bias: Optional[float]
+    mean_error: Optional[float]
+    mape: Optional[float]
+    error_std: Optional[float]
+    warning: Optional[str] = None
 
 
 class Top3ForecastItem(BaseModel):
     rank: int
     model: str
     metrics: MetricsModel
+    raw_forecast: List[int]
     forecast: List[int]
 
 
@@ -215,6 +225,7 @@ class ForecastResponse(BaseModel):
     status: str = "success"
     sku: str
     model: str
+    raw_forecast: List[int]
     forecast: List[int]
     metrics: MetricsModel
     analysis: AnalysisModel
@@ -233,6 +244,8 @@ class ErrorResponse(BaseModel):
 
 
 class ForecastRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     sku: str = Field(..., min_length=1, max_length=100)
     demand: List[float] = Field(..., min_length=1)
     periods: int = Field(default=15, ge=1, le=24)
@@ -241,7 +254,7 @@ class ForecastRequest(BaseModel):
     evaluation_horizon: int = Field(default=6, ge=1, le=15)
     n_splits: int = Field(default=3, ge=1, le=6)
     season_length: int = Field(default=12, ge=2, le=24)
-    trend_factor: float = Field(default=1.0, ge=0.01, le=10.0)
+    prognosefaktor: float = Field(default=1.0, ge=0.01, le=10.0, alias="trend_factor")
     forecast_start_month: int = Field(default=1, ge=1, le=12)
     last_observation_date: Optional[str] = None
     prefer_established_model: bool = Field(default=True)
@@ -251,26 +264,23 @@ class ForecastRequest(BaseModel):
 
 
 # =========================================================
-# DATUM / MONATSERKENNUNG
+# DATUM / MONATSLOGIK
 # =========================================================
-def infer_next_month_from_value(value: Any) -> Optional[int]:
-    """
-    Erkennt aus einem Datums-/Periodenwert den Folgemonat als Forecast-Startmonat.
-    Beispiele:
-    - 2026-02 -> 3
-    - 2026-02-15 -> 3
-    - Timestamp('2026-02-01') -> 3
-    """
-    if value is None:
-        return None
-
+def parse_datetime_safe(value: Any) -> Optional[pd.Timestamp]:
     try:
         ts = pd.to_datetime(value, errors="coerce")
         if pd.isna(ts):
             return None
-        return int((ts.month % 12) + 1)
+        return ts
     except Exception:
         return None
+
+
+def infer_next_month_from_value(value: Any) -> Optional[int]:
+    ts = parse_datetime_safe(value)
+    if ts is None:
+        return None
+    return int((ts.month % 12) + 1)
 
 
 def resolve_forecast_start_month(
@@ -281,6 +291,19 @@ def resolve_forecast_start_month(
     if inferred is not None:
         return inferred
     return explicit_start_month
+
+
+def build_history_months_from_last_observation(last_observation_date: Optional[str], n: int) -> Optional[List[int]]:
+    """
+    Erzeugt eine Monatsfolge für die Historie, falls nur das letzte Beobachtungsdatum bekannt ist
+    und die Daten als monatlich geordnet angenommen werden.
+    """
+    ts = parse_datetime_safe(last_observation_date)
+    if ts is None or n <= 0:
+        return None
+
+    hist_dates = pd.date_range(end=ts, periods=n, freq="MS")
+    return [int(x.month) for x in hist_dates]
 
 
 # =========================================================
@@ -329,13 +352,45 @@ def robust_mad(x: np.ndarray) -> float:
     return float(mad)
 
 
+def compute_adi_cv2(series: List[float]) -> Tuple[float, float]:
+    if not series:
+        return float("inf"), float("inf")
+
+    non_zero = [x for x in series if x > 0]
+    if len(non_zero) == 0:
+        return float("inf"), float("inf")
+
+    adi = len(series) / len(non_zero)
+    mean_nz = float(np.mean(non_zero))
+    std_nz = float(np.std(non_zero, ddof=0))
+    cv2 = (std_nz / mean_nz) ** 2 if mean_nz != 0 else float("inf")
+    return float(adi), float(cv2)
+
+
+def detect_demand_pattern(series: List[float]) -> str:
+    if not series:
+        return "no_demand"
+    if all(x == 0 for x in series):
+        return "all_zero"
+
+    adi, cv2 = compute_adi_cv2(series)
+
+    if adi > 1.32 and cv2 <= 0.49:
+        return "intermittent"
+    if adi > 1.32 and cv2 > 0.49:
+        return "lumpy"
+    if adi <= 1.32 and cv2 > 0.49:
+        return "erratic"
+    return "smooth"
+
+
 def detect_outliers_robust(series: List[float]) -> List[int]:
     """
-    Erkennt mögliche Ausreißer:
-    - negative Werte
-    - globale Ausreißer über Median/MAD
-    - lokale abrupte Sprünge
-    - verdächtige isolierte Nullen, aber NICHT pauschal bei intermittent/lumpy demand
+    Ziel:
+    - negative Werte immer flaggen
+    - isolierte verdächtige Nullen / starke Einbrüche bei smooth/erratic flaggen (Stockout/Datenproblem)
+    - echte Nullnachfrage bei intermittent/lumpy NICHT pauschal als Ausreißer behandeln
+    - positive Peaks (Promos) NICHT blind glätten
     """
     arr = np.asarray(series, dtype=float)
     flags = np.zeros(len(arr), dtype=int)
@@ -343,6 +398,7 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
     # negative Werte sind unplausibel
     flags[arr < 0] = 1
 
+    pattern = detect_demand_pattern([float(x) for x in arr.tolist()])
     non_zero = arr[arr > 0]
     if len(non_zero) < 3:
         return flags.tolist()
@@ -350,13 +406,11 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
     med = float(np.median(non_zero))
     mad = robust_mad(non_zero)
 
-    # Demand Pattern für Zero-Handling bestimmen
-    pattern = detect_demand_pattern([float(x) for x in arr.tolist()])
-
+    # Nur starke NEGATIVE Ausreißer über robust z-score markieren
     if mad > 0:
         robust_z = 0.6745 * (arr - med) / mad
-        robust_mask = np.abs(robust_z) > 3.5
-        flags[robust_mask] = 1
+        negative_robust_mask = robust_z < -3.5
+        flags[negative_robust_mask] = 1
 
     for i in range(1, len(arr) - 1):
         prev_v = arr[i - 1]
@@ -365,20 +419,19 @@ def detect_outliers_robust(series: List[float]) -> List[int]:
 
         local_med = float(np.median([prev_v, next_v]))
         if local_med > 0:
+            # Nur starke negative lokale Einbrüche markieren, keine positiven Peaks
             ratio = curr_v / local_med if local_med != 0 else 1.0
-            if ratio > 4.0 or (curr_v > 0 and ratio < 0.2):
+            if curr_v > 0 and ratio < 0.2:
                 flags[i] = 1
 
-        # Zero-Handling NUR für smooth/erratic
-        # Bei intermittent/lumpy sind echte Null-Nachfragen normal
+        # Null-Handling NUR für smooth/erratic, NICHT für intermittent/lumpy
         if curr_v == 0 and pattern in ("smooth", "erratic"):
             local_avg = (prev_v + next_v) / 2.0
-
-            # nur isolierte Null mit positiven Nachbarn prüfen
             if prev_v > 0 and next_v > 0 and local_avg > med * 0.5:
                 flags[i] = 1
 
     return flags.tolist()
+
 
 def impute_series(series: List[float], outlier_flags: List[int]) -> List[float]:
     arr = np.asarray(series, dtype=float)
@@ -415,36 +468,72 @@ def preprocess_demand(series: List[float]) -> Dict[str, Any]:
     }
 
 
-def compute_adi_cv2(series: List[float]) -> Tuple[float, float]:
-    if not series:
-        return float("inf"), float("inf")
+# =========================================================
+# SAISONALITÄT: Standard verwenden, bei klarer Abweichung überschreiben
+# =========================================================
+def derive_effective_seasonal_factors(
+    series: List[float],
+    season_length: int = 12,
+    history_months: Optional[List[int]] = None,
+    base_factors: Optional[Dict[int, float]] = None,
+) -> Tuple[Dict[int, float], str, bool]:
+    """
+    Standard:
+    - vordefinierte Faktoren verwenden
 
-    non_zero = [x for x in series if x > 0]
-    if len(non_zero) == 0:
-        return float("inf"), float("inf")
+    Override:
+    - nur wenn genug Historie vorhanden ist
+    - klare, belastbare monatliche Saisonalität erkennbar ist
+    - history_months vorliegt
+    """
+    base = dict(base_factors or SEASONAL_FACTORS)
 
-    adi = len(series) / len(non_zero)
-    mean_nz = float(np.mean(non_zero))
-    std_nz = float(np.std(non_zero, ddof=0))
-    cv2 = (std_nz / mean_nz) ** 2 if mean_nz != 0 else float("inf")
-    return float(adi), float(cv2)
+    if history_months is None:
+        return base, "default", False
 
+    if len(series) < 24:
+        return base, "default", False
 
-def detect_demand_pattern(series: List[float]) -> str:
-    if not series:
-        return "no_demand"
-    if all(x == 0 for x in series):
-        return "all_zero"
+    if len(history_months) != len(series):
+        return base, "default", False
 
-    adi, cv2 = compute_adi_cv2(series)
+    df = pd.DataFrame({
+        "value": [float(x) for x in series],
+        "month": history_months,
+    })
 
-    if adi > 1.32 and cv2 <= 0.49:
-        return "intermittent"
-    if adi > 1.32 and cv2 > 0.49:
-        return "lumpy"
-    if adi <= 1.32 and cv2 > 0.49:
-        return "erratic"
-    return "smooth"
+    if df["value"].mean() <= 0:
+        return base, "default", False
+
+    month_counts = df.groupby("month")["value"].count().to_dict()
+    covered_months = sum(1 for m in range(1, 13) if month_counts.get(m, 0) >= 2)
+    if covered_months < 8:
+        return base, "default", False
+
+    overall_mean = float(df["value"].mean())
+    learned = {}
+    for m in range(1, 13):
+        subset = df.loc[df["month"] == m, "value"]
+        if len(subset) >= 2:
+            learned[m] = float(subset.mean() / overall_mean) if overall_mean != 0 else 1.0
+        else:
+            learned[m] = base[m]
+
+    # Normalisieren auf Mittelwert 1
+    mean_factor = float(np.mean(list(learned.values())))
+    if mean_factor > 0:
+        learned = {m: float(v / mean_factor) for m, v in learned.items()}
+
+    # Prüfen, ob klare Abweichung vorliegt
+    deviations = [abs(learned[m] - base[m]) for m in range(1, 13)]
+    max_dev = max(deviations)
+    std_learned = float(np.std(list(learned.values()), ddof=0))
+
+    # konservative Regel: nur bei klarer, belastbarer Abweichung überschreiben
+    if max_dev >= 0.15 and std_learned >= 0.08:
+        return learned, "learned_override", True
+
+    return base, "default", False
 
 
 # =========================================================
@@ -467,6 +556,29 @@ def bias(actual: List[float], predicted: List[float]) -> float:
     if not actual:
         return 0.0
     return float(np.mean([p - a for a, p in zip(actual, predicted)]))
+
+
+def mean_error(actual: List[float], predicted: List[float]) -> float:
+    return bias(actual, predicted)
+
+
+def mape(actual: List[float], predicted: List[float]) -> Optional[float]:
+    """
+    MAPE nur über Beobachtungen mit actual != 0.
+    Bei Reihen mit vielen echten Nullen kann MAPE eingeschränkt aussagekräftig sein.
+    """
+    pairs = [(a, p) for a, p in zip(actual, predicted) if a != 0]
+    if not pairs:
+        return None
+    values = [abs((a - p) / a) for a, p in pairs]
+    return float(np.mean(values))
+
+
+def error_std(actual: List[float], predicted: List[float]) -> float:
+    if not actual:
+        return 0.0
+    errors = np.asarray([p - a for a, p in zip(actual, predicted)], dtype=float)
+    return float(np.std(errors, ddof=0))
 
 
 def mase(actual: List[float], predicted: List[float], train: List[float], m: int = 1) -> float:
@@ -496,7 +608,8 @@ def naive_forecast(train: List[float], periods: int) -> List[float]:
 
 def seasonal_naive_forecast(train: List[float], periods: int, season_length: int = 12) -> List[float]:
     if len(train) < season_length:
-        raise ValueError("Zu wenig Historie für seasonal_naive.")
+        # Fallback statt harter Blockade
+        return naive_forecast(train, periods)
 
     history = list(map(float, train))
     forecasts: List[float] = []
@@ -551,8 +664,9 @@ def holt_forecast(train: List[float], periods: int) -> List[float]:
 
 
 def holt_winters_forecast(train: List[float], periods: int, season_length: int = 12) -> List[float]:
-    if len(train) < season_length * 2:
-        raise ValueError("Zu wenig Historie für Holt-Winters.")
+    if len(train) < max(season_length, 12):
+        # milder Fallback statt kompletter Blockade
+        return holt_forecast(train, periods)
 
     model = ExponentialSmoothing(
         np.asarray(train, dtype=float),
@@ -588,8 +702,8 @@ def sarima_forecast(
     order: Tuple[int, int, int] = (1, 1, 1),
     seasonal_order: Tuple[int, int, int, int] = (1, 1, 1, 12),
 ) -> List[float]:
-    if len(train) < 24:
-        raise ValueError("Zu wenig Historie für SARIMA.")
+    if len(train) < max(12, seasonal_order[3]):
+        return arima_forecast(train, periods, order=order)
 
     model = SARIMAX(
         np.asarray(train, dtype=float),
@@ -662,52 +776,84 @@ def tsb_forecast(train: List[float], periods: int, alpha: float = 0.2, beta: flo
 # =========================================================
 # ML FEATURES
 # =========================================================
-def create_ml_features(series: List[float], season_length: int = 12) -> Tuple[np.ndarray, np.ndarray]:
+def select_ml_lags(series_length: int, season_length: int = 12) -> List[int]:
+    candidate_lags = [1, 2, 3, 6, 12]
+    lags = [lag for lag in candidate_lags if lag < series_length]
+
+    if len(lags) < 3:
+        # adaptive fallback
+        lags = [lag for lag in range(1, min(series_length, 5))]
+
+    return lags
+
+
+def create_ml_features(
+    series: List[float],
+    season_length: int = 12,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     values = list(map(float, series))
+    lags = select_ml_lags(len(values), season_length=season_length)
+
+    if len(values) < max(6, max(lags) + 3):
+        raise ValueError("Zu wenig Historie für ML-Features.")
+
+    max_lag = max(lags)
     rows: List[List[float]] = []
     targets: List[float] = []
 
-    if len(values) <= 12:
-        raise ValueError("Zu wenig Historie für ML-Features.")
+    for t in range(max_lag, len(values)):
+        feature_row: List[float] = []
 
-    for t in range(12, len(values)):
-        lag1 = values[t - 1]
-        lag2 = values[t - 2]
-        lag3 = values[t - 3]
-        lag6 = values[t - 6]
-        lag12 = values[t - 12]
-        rmean3 = float(np.mean(values[t - 3:t]))
-        rmean6 = float(np.mean(values[t - 6:t]))
-        rstd3 = float(np.std(values[t - 3:t], ddof=0))
-        rstd6 = float(np.std(values[t - 6:t], ddof=0))
-        month_idx = float(t % season_length)
+        for lag in lags:
+            feature_row.append(values[t - lag])
 
-        rows.append([lag1, lag2, lag3, lag6, lag12, rmean3, rmean6, rstd3, rstd6, month_idx])
+        # adaptive rolling features
+        feature_row.append(float(np.mean(values[max(0, t - 3):t])))
+        feature_row.append(float(np.mean(values[max(0, t - 6):t])))
+        feature_row.append(float(np.std(values[max(0, t - 3):t], ddof=0)))
+        feature_row.append(float(np.std(values[max(0, t - 6):t], ddof=0)))
+        feature_row.append(float(t % season_length))
+
+        rows.append(feature_row)
         targets.append(values[t])
 
-    return np.asarray(rows), np.asarray(targets)
+    meta = {
+        "lags": lags,
+        "feature_count": len(rows[0]) if rows else 0,
+    }
+
+    return np.asarray(rows), np.asarray(targets), meta
 
 
-def recursive_ml_forecast(model: Any, train: List[float], periods: int, season_length: int = 12) -> List[float]:
+def recursive_ml_forecast(
+    model: Any,
+    train: List[float],
+    periods: int,
+    season_length: int = 12,
+    meta: Optional[Dict[str, Any]] = None,
+) -> List[float]:
     history = list(map(float, train))
     forecasts: List[float] = []
 
+    lags = meta["lags"] if meta and "lags" in meta else select_ml_lags(len(history), season_length)
+
     for _ in range(periods):
         t = len(history)
+        x_new: List[float] = []
 
-        lag1 = history[t - 1]
-        lag2 = history[t - 2]
-        lag3 = history[t - 3]
-        lag6 = history[t - 6]
-        lag12 = history[t - 12]
-        rmean3 = float(np.mean(history[t - 3:t]))
-        rmean6 = float(np.mean(history[t - 6:t]))
-        rstd3 = float(np.std(history[t - 3:t], ddof=0))
-        rstd6 = float(np.std(history[t - 6:t], ddof=0))
-        month_idx = float(t % season_length)
+        for lag in lags:
+            if t - lag < 0:
+                x_new.append(history[-1] if history else 0.0)
+            else:
+                x_new.append(history[t - lag])
 
-        x_new = np.asarray([[lag1, lag2, lag3, lag6, lag12, rmean3, rmean6, rstd3, rstd6, month_idx]])
-        pred = float(model.predict(x_new)[0])
+        x_new.append(float(np.mean(history[max(0, t - 3):t])))
+        x_new.append(float(np.mean(history[max(0, t - 6):t])))
+        x_new.append(float(np.std(history[max(0, t - 3):t], ddof=0)))
+        x_new.append(float(np.std(history[max(0, t - 6):t], ddof=0)))
+        x_new.append(float(t % season_length))
+
+        pred = float(model.predict(np.asarray([x_new]))[0])
         pred = max(0.0, pred)
 
         forecasts.append(pred)
@@ -717,10 +863,7 @@ def recursive_ml_forecast(model: Any, train: List[float], periods: int, season_l
 
 
 def gradient_boosting_forecast(train: List[float], periods: int, season_length: int = 12) -> List[float]:
-    if len(train) < 24:
-        raise ValueError("Zu wenig Historie für Gradient Boosting.")
-
-    X, y = create_ml_features(train, season_length=season_length)
+    X, y, meta = create_ml_features(train, season_length=season_length)
     model = GradientBoostingRegressor(
         random_state=42,
         n_estimators=300,
@@ -729,14 +872,11 @@ def gradient_boosting_forecast(train: List[float], periods: int, season_length: 
         subsample=0.9,
     )
     model.fit(X, y)
-    return recursive_ml_forecast(model, train, periods, season_length=season_length)
+    return recursive_ml_forecast(model, train, periods, season_length=season_length, meta=meta)
 
 
 def random_forest_forecast(train: List[float], periods: int, season_length: int = 12) -> List[float]:
-    if len(train) < 24:
-        raise ValueError("Zu wenig Historie für Random Forest.")
-
-    X, y = create_ml_features(train, season_length=season_length)
+    X, y, meta = create_ml_features(train, season_length=season_length)
     model = RandomForestRegressor(
         n_estimators=400,
         max_depth=10,
@@ -746,14 +886,11 @@ def random_forest_forecast(train: List[float], periods: int, season_length: int 
         n_jobs=-1,
     )
     model.fit(X, y)
-    return recursive_ml_forecast(model, train, periods, season_length=season_length)
+    return recursive_ml_forecast(model, train, periods, season_length=season_length, meta=meta)
 
 
 def extra_trees_forecast(train: List[float], periods: int, season_length: int = 12) -> List[float]:
-    if len(train) < 24:
-        raise ValueError("Zu wenig Historie für Extra Trees.")
-
-    X, y = create_ml_features(train, season_length=season_length)
+    X, y, meta = create_ml_features(train, season_length=season_length)
     model = ExtraTreesRegressor(
         n_estimators=400,
         max_depth=10,
@@ -763,14 +900,11 @@ def extra_trees_forecast(train: List[float], periods: int, season_length: int = 
         n_jobs=-1,
     )
     model.fit(X, y)
-    return recursive_ml_forecast(model, train, periods, season_length=season_length)
+    return recursive_ml_forecast(model, train, periods, season_length=season_length, meta=meta)
 
 
 def hist_gradient_boosting_forecast(train: List[float], periods: int, season_length: int = 12) -> List[float]:
-    if len(train) < 24:
-        raise ValueError("Zu wenig Historie für HistGradientBoosting.")
-
-    X, y = create_ml_features(train, season_length=season_length)
+    X, y, meta = create_ml_features(train, season_length=season_length)
     model = HistGradientBoostingRegressor(
         learning_rate=0.03,
         max_depth=6,
@@ -779,14 +913,11 @@ def hist_gradient_boosting_forecast(train: List[float], periods: int, season_len
         random_state=42,
     )
     model.fit(X, y)
-    return recursive_ml_forecast(model, train, periods, season_length=season_length)
+    return recursive_ml_forecast(model, train, periods, season_length=season_length, meta=meta)
 
 
 def mlp_forecast(train: List[float], periods: int, season_length: int = 12) -> List[float]:
-    if len(train) < 24:
-        raise ValueError("Zu wenig Historie für MLP.")
-
-    X, y = create_ml_features(train, season_length=season_length)
+    X, y, meta = create_ml_features(train, season_length=season_length)
     model = Pipeline(
         steps=[
             ("scaler", StandardScaler()),
@@ -805,26 +936,48 @@ def mlp_forecast(train: List[float], periods: int, season_length: int = 12) -> L
         ]
     )
     model.fit(X, y)
-    return recursive_ml_forecast(model, train, periods, season_length=season_length)
+    return recursive_ml_forecast(model, train, periods, season_length=season_length, meta=meta)
 
 
 # =========================================================
-# BUSINESS ADJUSTMENTS
+# PROGNOSEFAKTOR + BUSINESS ADJUSTMENTS
 # =========================================================
 def apply_business_adjustments(
     forecast: List[float],
     start_month: int,
     seasonal_factors: Dict[int, float],
-    trend_factor: float = 1.0,
+    prognosefaktor: float = 1.0,
+    last_observation_date: Optional[str] = None,
 ) -> List[float]:
+    """
+    Prognosefaktor:
+    - KEIN exponentielles Monatswachstum
+    - kalenderjahresbezogene Interpretation:
+      1.05 = Forecastjahr ca. 5% über Vorjahr
+    - bei Forecasts über mehrere Jahre:
+      Folgejahre werden year-over-year weitergeführt
+    """
     adjusted: List[float] = []
+
+    last_obs_ts = parse_datetime_safe(last_observation_date)
+    forecast_start_ts: Optional[pd.Timestamp] = None
+    if last_obs_ts is not None:
+        forecast_start_ts = (last_obs_ts + pd.offsets.MonthBegin(1)).normalize()
 
     for i, value in enumerate(forecast):
         month = ((start_month - 1 + i) % 12) + 1
         season_factor = float(seasonal_factors.get(month, 1.0))
-        monthly_trend_factor = trend_factor ** (i / 12.0)
 
-        new_val = float(value) * season_factor * monthly_trend_factor
+        if forecast_start_ts is not None:
+            current_ts = forecast_start_ts + pd.DateOffset(months=i)
+            year_offset = current_ts.year - last_obs_ts.year
+            yearly_factor = prognosefaktor ** max(year_offset, 0)
+        else:
+            # Fallback in 12-Monats-Blöcken
+            year_offset = (i // 12) + 1
+            yearly_factor = prognosefaktor ** year_offset
+
+        new_val = float(value) * season_factor * yearly_factor
         adjusted.append(max(0.0, new_val))
 
     return adjusted
@@ -871,49 +1024,53 @@ def run_model(model_name: str, train: List[float], periods: int, season_length: 
 
 
 # =========================================================
-# MODEL ELIGIBILITY
+# MODEL EIGNUNG / WARNHINWEISE
 # =========================================================
-def model_is_allowed(model_name: str, train: List[float], pattern: str, season_length: int = 12) -> bool:
+def model_can_attempt(model_name: str, train: List[float], pattern: str, season_length: int = 12) -> bool:
     n = len(train)
     non_zero = count_nonzero(train)
-
-    if n < 12:
-        return model_name in ("naive", "moving_average", "ets", "holt")
 
     if model_name == "naive":
         return n >= 1
     if model_name == "seasonal_naive":
-        return n >= season_length * 2
+        return n >= max(2, min(season_length, n))
     if model_name == "moving_average":
-        return n >= 3
+        return n >= 2
     if model_name == "ets":
         return n >= 2
     if model_name == "holt":
         return n >= 2
     if model_name == "holt_winters":
-        return n >= season_length * 2
+        return n >= max(6, season_length)
     if model_name == "arima":
-        return n >= 12
+        return n >= 3
     if model_name == "sarima":
-        return n >= season_length * 2
+        return n >= max(12, season_length)
     if model_name == "croston":
-        return pattern in ("intermittent", "lumpy") and non_zero >= 2
+        return non_zero >= 1
     if model_name == "sba":
-        return pattern in ("intermittent", "lumpy") and non_zero >= 2
+        return non_zero >= 1
     if model_name == "tsb":
-        return pattern in ("intermittent", "lumpy") and non_zero >= 2
-    if model_name == "gradient_boosting":
-        return n >= 24
-    if model_name == "random_forest":
-        return n >= 24
-    if model_name == "extra_trees":
-        return n >= 24
-    if model_name == "hist_gradient_boosting":
-        return n >= 24
-    if model_name == "mlp":
-        return n >= 24
+        return non_zero >= 1
+    if model_name in ("gradient_boosting", "random_forest", "extra_trees", "hist_gradient_boosting", "mlp"):
+        return n >= 8
 
     return False
+
+
+def model_warning(model_name: str, train: List[float], pattern: str, season_length: int = 12) -> Optional[str]:
+    n = len(train)
+
+    if n < 12 and model_name in ("arima", "sarima", "gradient_boosting", "random_forest", "extra_trees", "hist_gradient_boosting", "mlp"):
+        return "Kurze Historie: Modell kann gerechnet werden, ist aber methodisch eingeschränkt belastbar."
+
+    if model_name in ("croston", "sba", "tsb") and pattern not in ("intermittent", "lumpy"):
+        return "Intermittierendes Verfahren auf nicht-intermittenter Nachfrage."
+
+    if model_name == "holt_winters" and n < 24:
+        return "Saisonmodell mit begrenzter Historie."
+
+    return None
 
 
 # =========================================================
@@ -990,7 +1147,7 @@ def evaluate_model_rolling(
         if len(train) == 0 or len(test) == 0:
             continue
 
-        if not model_is_allowed(model_name, train, pattern, season_length):
+        if not model_can_attempt(model_name, train, pattern, season_length):
             continue
 
         try:
@@ -1004,6 +1161,9 @@ def evaluate_model_rolling(
                     "wape": wape(test, preds),
                     "mase": mase(test, preds, train, m=1),
                     "bias": bias(test, preds),
+                    "mean_error": mean_error(test, preds),
+                    "mape": mape(test, preds),
+                    "error_std": error_std(test, preds),
                 }
             )
         except Exception:
@@ -1012,18 +1172,37 @@ def evaluate_model_rolling(
     if not split_results:
         return {
             "model": model_name,
-            "metrics": {"mae": None, "wape": None, "mase": None, "bias": None},
+            "warning": model_warning(model_name, series, pattern, season_length),
+            "metrics": {
+                "mae": None,
+                "wape": None,
+                "mase": None,
+                "bias": None,
+                "mean_error": None,
+                "mape": None,
+                "error_std": None,
+            },
             "backtest_config": {"splits": 0, "horizon": horizon, "backtest_available": True},
             "split_metrics": [],
         }
 
+    def avg_metric(key: str) -> Optional[float]:
+        vals = [x[key] for x in split_results if x[key] is not None]
+        if not vals:
+            return None
+        return float(np.mean(vals))
+
     return {
         "model": model_name,
+        "warning": model_warning(model_name, series, pattern, season_length),
         "metrics": {
-            "mae": round(float(np.mean([x["mae"] for x in split_results])), 2),
-            "wape": round(float(np.mean([x["wape"] for x in split_results])), 4),
-            "mase": round(float(np.mean([x["mase"] for x in split_results])), 4),
-            "bias": round(float(np.mean([x["bias"] for x in split_results])), 2),
+            "mae": round(avg_metric("mae"), 2) if avg_metric("mae") is not None else None,
+            "wape": round(avg_metric("wape"), 4) if avg_metric("wape") is not None else None,
+            "mase": round(avg_metric("mase"), 4) if avg_metric("mase") is not None else None,
+            "bias": round(avg_metric("bias"), 2) if avg_metric("bias") is not None else None,
+            "mean_error": round(avg_metric("mean_error"), 2) if avg_metric("mean_error") is not None else None,
+            "mape": round(avg_metric("mape"), 4) if avg_metric("mape") is not None else None,
+            "error_std": round(avg_metric("error_std"), 2) if avg_metric("error_std") is not None else None,
         },
         "backtest_config": {
             "splits": len(split_results),
@@ -1037,6 +1216,9 @@ def evaluate_model_rolling(
                 "wape": round(x["wape"], 4),
                 "mase": round(x["mase"], 4),
                 "bias": round(x["bias"], 2),
+                "mean_error": round(x["mean_error"], 2),
+                "mape": round(x["mape"], 4) if x["mape"] is not None else None,
+                "error_std": round(x["error_std"], 2),
             }
             for x in split_results
         ],
@@ -1069,7 +1251,7 @@ def choose_best_model(
         "mlp",
     ]
 
-    valid_models = [m for m in candidate_models if model_is_allowed(m, series, pattern, season_length=season_length)]
+    valid_models = [m for m in candidate_models if model_can_attempt(m, series, pattern, season_length=season_length)]
 
     if not valid_models:
         raise ValueError("Keine zulässigen Modelle verfügbar.")
@@ -1097,8 +1279,10 @@ def choose_best_model(
     results.sort(
         key=lambda x: (
             1 if x["metrics"]["mase"] is None else (0 if x["metrics"]["mase"] < 1 else 1),
+            x["metrics"]["mape"] if x["metrics"]["mape"] is not None else float("inf"),
             x["metrics"]["wape"] if x["metrics"]["wape"] is not None else float("inf"),
             x["metrics"]["mae"] if x["metrics"]["mae"] is not None else float("inf"),
+            abs(x["metrics"]["mean_error"]) if x["metrics"]["mean_error"] is not None else float("inf"),
         )
     )
 
@@ -1113,12 +1297,21 @@ def choose_best_model(
 # FORECAST CORE
 # =========================================================
 def metrics_none() -> Dict[str, Optional[float]]:
-    return {"mae": None, "wape": None, "mase": None, "bias": None}
+    return {
+        "mae": None,
+        "wape": None,
+        "mase": None,
+        "bias": None,
+        "mean_error": None,
+        "mape": None,
+        "error_std": None,
+    }
 
 
 def build_success_response(
     sku: str,
     model: str,
+    raw_forecast: List[int],
     forecast: List[int],
     metrics: Dict[str, Optional[float]],
     analysis: Dict[str, Any],
@@ -1133,6 +1326,7 @@ def build_success_response(
         "status": "success",
         "sku": sku,
         "model": model,
+        "raw_forecast": raw_forecast,
         "forecast": forecast,
         "metrics": metrics,
         "analysis": analysis,
@@ -1148,10 +1342,10 @@ def build_success_response(
 def fallback_model_for_short_history(cleaned: List[float], pattern: str, season_length: int) -> str:
     if len(cleaned) < 4:
         return "naive"
-    if model_is_allowed("ets", cleaned, pattern, season_length):
-        return "ets"
-    if model_is_allowed("moving_average", cleaned, pattern, season_length):
-        return "moving_average"
+    try_models = ["ets", "moving_average", "holt", "naive"]
+    for m in try_models:
+        if model_can_attempt(m, cleaned, pattern, season_length):
+            return m
     return "naive"
 
 
@@ -1160,20 +1354,23 @@ def build_top_3_forecasts_from_ranking(
     cleaned: List[float],
     periods: int,
     season_length: int,
-    trend_factor: float,
+    prognosefaktor: float,
     forecast_start_month: int,
+    effective_seasonal_factors: Dict[int, float],
+    last_observation_date: Optional[str],
 ) -> List[Dict[str, Any]]:
     top_3: List[Dict[str, Any]] = []
 
     for rank, item in enumerate(ranking[:3], start=1):
         model_name = item["model"]
 
-        fc = run_model(model_name, cleaned, periods, season_length=season_length)
-        fc = apply_business_adjustments(
-            forecast=fc,
+        raw_fc = run_model(model_name, cleaned, periods, season_length=season_length)
+        adj_fc = apply_business_adjustments(
+            forecast=raw_fc,
             start_month=forecast_start_month,
-            seasonal_factors=SEASONAL_FACTORS,
-            trend_factor=trend_factor,
+            seasonal_factors=effective_seasonal_factors,
+            prognosefaktor=prognosefaktor,
+            last_observation_date=last_observation_date,
         )
 
         top_3.append(
@@ -1185,15 +1382,22 @@ def build_top_3_forecasts_from_ranking(
                     "wape": item["metrics"].get("wape"),
                     "mase": item["metrics"].get("mase"),
                     "bias": item["metrics"].get("bias"),
+                    "mean_error": item["metrics"].get("mean_error"),
+                    "mape": item["metrics"].get("mape"),
+                    "error_std": item["metrics"].get("error_std"),
                 },
-                "forecast": round_forecast(fc),
+                "raw_forecast": round_forecast(raw_fc),
+                "forecast": round_forecast(adj_fc),
             }
         )
 
     return top_3
 
 
-def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
+def compute_forecast_from_request(
+    req: ForecastRequest,
+    history_months: Optional[List[int]] = None,
+) -> Dict[str, Any]:
     validate_inputs(
         demand=req.demand,
         periods=req.periods,
@@ -1210,10 +1414,18 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
     prep = preprocess_demand(req.demand)
     cleaned = prep["cleaned"]
 
+    effective_seasonal_factors, seasonal_factor_source, seasonal_override_applied = derive_effective_seasonal_factors(
+        series=cleaned,
+        season_length=req.season_length,
+        history_months=history_months,
+        base_factors=SEASONAL_FACTORS,
+    )
+
     if len(cleaned) == 0:
         return build_success_response(
             sku=req.sku,
             model="no_forecast",
+            raw_forecast=[],
             forecast=[],
             metrics=metrics_none(),
             analysis={
@@ -1222,8 +1434,10 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
                 "cv2": None,
                 "outlier_count": prep["outlier_count"],
                 "outlier_flags": prep["outlier_flags"],
-                "trend_factor": req.trend_factor,
+                "prognosefaktor": req.prognosefaktor,
                 "forecast_start_month": effective_start_month,
+                "seasonal_factor_source": seasonal_factor_source,
+                "seasonal_override_applied": seasonal_override_applied,
             },
             backtest_config={"splits": 0, "horizon": 1, "backtest_available": True},
             model_ranking=[],
@@ -1246,6 +1460,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
         return build_success_response(
             sku=req.sku,
             model="no_forecast",
+            raw_forecast=[0] * req.periods,
             forecast=[0] * req.periods,
             metrics=metrics_none(),
             analysis={
@@ -1254,8 +1469,10 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
                 "cv2": None,
                 "outlier_count": prep["outlier_count"],
                 "outlier_flags": prep["outlier_flags"],
-                "trend_factor": req.trend_factor,
+                "prognosefaktor": req.prognosefaktor,
                 "forecast_start_month": effective_start_month,
+                "seasonal_factor_source": seasonal_factor_source,
+                "seasonal_override_applied": seasonal_override_applied,
             },
             backtest_config={"splits": 0, "horizon": 1, "backtest_available": True},
             model_ranking=[],
@@ -1286,8 +1503,10 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
         "cv2": round(cv2, 4) if math.isfinite(cv2) else None,
         "outlier_count": prep["outlier_count"],
         "outlier_flags": prep["outlier_flags"],
-        "trend_factor": req.trend_factor,
+        "prognosefaktor": req.prognosefaktor,
         "forecast_start_month": effective_start_month,
+        "seasonal_factor_source": seasonal_factor_source,
+        "seasonal_override_applied": seasonal_override_applied,
     }
 
     preprocessing = {
@@ -1305,8 +1524,8 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
     best_model: str
 
     if req.locked_model and req.locked_model != "auto":
-        if not model_is_allowed(req.locked_model, cleaned, pattern, req.season_length):
-            raise ValueError(f"locked_model '{req.locked_model}' ist für diese Zeitreihe nicht zulässig.")
+        if not model_can_attempt(req.locked_model, cleaned, pattern, req.season_length):
+            raise ValueError(f"locked_model '{req.locked_model}' kann für diese Zeitreihe nicht gerechnet werden.")
 
         best_model = req.locked_model
         evaluation = evaluate_model_rolling(
@@ -1334,8 +1553,8 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
         backtest_config = selection["best"]["backtest_config"]
 
     else:
-        if not model_is_allowed(req.model, cleaned, pattern, req.season_length):
-            raise ValueError(f"Modell '{req.model}' ist für diese Zeitreihe nicht zulässig.")
+        if not model_can_attempt(req.model, cleaned, pattern, req.season_length):
+            raise ValueError(f"Modell '{req.model}' kann für diese Zeitreihe nicht gerechnet werden.")
 
         best_model = req.model
         evaluation = evaluate_model_rolling(
@@ -1349,6 +1568,20 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
         ranking = [evaluation]
         backtest_config = evaluation["backtest_config"]
 
+    if not ranking:
+        # Sicherheitsfallback
+        best_model = fallback_model_for_short_history(cleaned, pattern, req.season_length)
+        fallback_eval = evaluate_model_rolling(
+            series=cleaned,
+            model_name=best_model,
+            pattern=pattern,
+            n_splits=req.n_splits,
+            horizon=req.evaluation_horizon,
+            season_length=req.season_length,
+        )
+        ranking = [fallback_eval]
+        backtest_config = fallback_eval["backtest_config"]
+
     selected_model = best_model
     model_switch_suggested = False
     suggested_model = None
@@ -1357,7 +1590,7 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
     model_change_applied = False
 
     if req.model == "auto" and req.prefer_established_model and established_model:
-        if model_is_allowed(established_model, cleaned, pattern, req.season_length):
+        if model_can_attempt(established_model, cleaned, pattern, req.season_length):
             if established_model != best_model:
                 suggestion = should_suggest_model_switch(
                     established_model=established_model,
@@ -1402,12 +1635,13 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             source="manual_confirmation",
         )
 
-    final_forecast = run_model(selected_model, cleaned, req.periods, season_length=req.season_length)
+    raw_forecast_values = run_model(selected_model, cleaned, req.periods, season_length=req.season_length)
     final_forecast = apply_business_adjustments(
-        forecast=final_forecast,
+        forecast=raw_forecast_values,
         start_month=effective_start_month,
-        seasonal_factors=SEASONAL_FACTORS,
-        trend_factor=req.trend_factor,
+        seasonal_factors=effective_seasonal_factors,
+        prognosefaktor=req.prognosefaktor,
+        last_observation_date=req.last_observation_date,
     )
 
     if req.save_selected_model_as_established and not established_model:
@@ -1423,8 +1657,10 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
         cleaned=cleaned,
         periods=req.periods,
         season_length=req.season_length,
-        trend_factor=req.trend_factor,
+        prognosefaktor=req.prognosefaktor,
         forecast_start_month=effective_start_month,
+        effective_seasonal_factors=effective_seasonal_factors,
+        last_observation_date=req.last_observation_date,
     )
 
     ranking_top_8 = ranking[:8]
@@ -1435,6 +1671,10 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
             "wape": item["metrics"].get("wape"),
             "mase": item["metrics"].get("mase"),
             "bias": item["metrics"].get("bias"),
+            "mean_error": item["metrics"].get("mean_error"),
+            "mape": item["metrics"].get("mape"),
+            "error_std": item["metrics"].get("error_std"),
+            "warning": item.get("warning"),
         }
         for item in ranking_top_8
     ]
@@ -1451,12 +1691,16 @@ def compute_forecast_from_request(req: ForecastRequest) -> Dict[str, Any]:
     return build_success_response(
         sku=req.sku,
         model=selected_model,
+        raw_forecast=round_forecast(raw_forecast_values),
         forecast=round_forecast(final_forecast),
         metrics={
             "mae": selected_metrics.get("mae"),
             "wape": selected_metrics.get("wape"),
             "mase": selected_metrics.get("mase"),
             "bias": selected_metrics.get("bias"),
+            "mean_error": selected_metrics.get("mean_error"),
+            "mape": selected_metrics.get("mape"),
+            "error_std": selected_metrics.get("error_std"),
         },
         analysis=analysis,
         backtest_config=backtest_config,
@@ -1550,6 +1794,7 @@ def build_output_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
     for result in results:
         sku = result["sku"]
         model = result.get("model", "")
+        raw_forecast = result.get("raw_forecast", [])
         metrics = result.get("metrics", {})
         analysis = result.get("analysis", {})
         ranking = result.get("model_ranking", [])
@@ -1562,17 +1807,23 @@ def build_output_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
                 "SKU": sku,
                 "Selected_Model": model,
                 "Forecast_Period": i,
+                "Raw_Forecast": raw_forecast[i - 1] if i - 1 < len(raw_forecast) else None,
                 "Forecast": value,
                 "MAE": metrics.get("mae"),
                 "WAPE": metrics.get("wape"),
                 "MASE": metrics.get("mase"),
                 "BIAS": metrics.get("bias"),
+                "Mean_Error": metrics.get("mean_error"),
+                "MAPE": metrics.get("mape"),
+                "Error_STD": metrics.get("error_std"),
                 "Demand_Pattern": analysis.get("demand_pattern"),
                 "ADI": analysis.get("adi"),
                 "CV2": analysis.get("cv2"),
                 "Outlier_Count": analysis.get("outlier_count"),
-                "Trend_Factor": analysis.get("trend_factor"),
+                "Prognosefaktor": analysis.get("prognosefaktor"),
                 "Forecast_Start_Month": analysis.get("forecast_start_month"),
+                "Seasonal_Factor_Source": analysis.get("seasonal_factor_source"),
+                "Seasonal_Override_Applied": analysis.get("seasonal_override_applied"),
                 "Established_Model": established.get("established_model"),
                 "Model_Switch_Suggested": established.get("model_switch_suggested"),
                 "Suggested_Model": established.get("suggested_model"),
@@ -1581,12 +1832,17 @@ def build_output_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
             }
 
             for idx, item in enumerate(top3[:3], start=1):
+                raw_fc = item.get("raw_forecast", [])
                 fc = item.get("forecast", [])
                 row[f"Top{idx}_Model"] = item.get("model")
                 row[f"Top{idx}_MAE"] = item.get("metrics", {}).get("mae")
                 row[f"Top{idx}_WAPE"] = item.get("metrics", {}).get("wape")
                 row[f"Top{idx}_MASE"] = item.get("metrics", {}).get("mase")
                 row[f"Top{idx}_BIAS"] = item.get("metrics", {}).get("bias")
+                row[f"Top{idx}_Mean_Error"] = item.get("metrics", {}).get("mean_error")
+                row[f"Top{idx}_MAPE"] = item.get("metrics", {}).get("mape")
+                row[f"Top{idx}_Error_STD"] = item.get("metrics", {}).get("error_std")
+                row[f"Top{idx}_Raw_Forecast"] = raw_fc[i - 1] if i - 1 < len(raw_fc) else None
                 row[f"Top{idx}_Forecast"] = fc[i - 1] if i - 1 < len(fc) else None
 
             for idx, item in enumerate(ranking[:8], start=1):
@@ -1595,6 +1851,10 @@ def build_output_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
                 row[f"Rank{idx}_WAPE"] = item.get("wape")
                 row[f"Rank{idx}_MASE"] = item.get("mase")
                 row[f"Rank{idx}_BIAS"] = item.get("bias")
+                row[f"Rank{idx}_Mean_Error"] = item.get("mean_error")
+                row[f"Rank{idx}_MAPE"] = item.get("mape")
+                row[f"Rank{idx}_Error_STD"] = item.get("error_std")
+                row[f"Rank{idx}_Warning"] = item.get("warning")
 
             rows.append(row)
 
@@ -1682,7 +1942,8 @@ def forecast(
     verify_bearer_token(authorization)
 
     try:
-        return compute_forecast_from_request(req)
+        history_months = build_history_months_from_last_observation(req.last_observation_date, len(req.demand))
+        return compute_forecast_from_request(req, history_months=history_months)
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -1707,7 +1968,8 @@ def forecast(
 async def forecast_file(
     file: UploadFile = File(...),
     authorization: Optional[str] = Header(default=None),
-    trend_factor: float = Form(1.0),
+    prognosefaktor: Optional[float] = Form(None),
+    trend_factor: Optional[float] = Form(None),  # Rückwärtskompatibilität
     periods: int = Form(15),
     model: str = Form("auto"),
     locked_model: str = Form(""),
@@ -1726,6 +1988,12 @@ async def forecast_file(
     try:
         if not file.filename:
             raise HTTPException(status_code=400, detail="Es wurde keine Datei übergeben.")
+
+        effective_prognosefaktor = (
+            prognosefaktor if prognosefaktor is not None
+            else trend_factor if trend_factor is not None
+            else 1.0
+        )
 
         input_format = detect_file_format(file.filename)
         if output_format.lower().strip() == "same":
@@ -1761,11 +2029,13 @@ async def forecast_file(
 
             inferred_start_month: Optional[int] = None
             last_observation_date: Optional[str] = None
+            history_months: Optional[List[int]] = None
 
             if date_col:
                 try:
                     valid_dates = group[date_col].dropna()
                     if len(valid_dates) > 0:
+                        history_months = [int(x.month) for x in valid_dates.tolist()]
                         last_date = valid_dates.iloc[-1]
                         inferred_start_month = infer_next_month_from_value(last_date)
                         if pd.notna(last_date):
@@ -1773,6 +2043,7 @@ async def forecast_file(
                 except Exception:
                     inferred_start_month = None
                     last_observation_date = None
+                    history_months = None
 
             effective_start_month = inferred_start_month if inferred_start_month is not None else forecast_start_month
 
@@ -1785,7 +2056,7 @@ async def forecast_file(
                 evaluation_horizon=evaluation_horizon,
                 n_splits=n_splits,
                 season_length=season_length,
-                trend_factor=trend_factor,
+                prognosefaktor=effective_prognosefaktor,
                 forecast_start_month=effective_start_month,
                 last_observation_date=last_observation_date,
                 prefer_established_model=prefer_established_model,
@@ -1794,7 +2065,7 @@ async def forecast_file(
                 save_selected_model_as_established=save_selected_model_as_established,
             )
 
-            result = compute_forecast_from_request(req)
+            result = compute_forecast_from_request(req, history_months=history_months)
             results.append(result)
 
         result_df = build_output_dataframe(results)
